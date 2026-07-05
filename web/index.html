@@ -138,7 +138,12 @@ const $errors = document.getElementById('errors');
 const $diagram = document.getElementById('diagram');
 const $frontend = document.getElementById('frontend');
 
-let skin = null;
+const skins = {};
+async function getSkin(url) {
+  if (!skins[url]) skins[url] = await (await fetch(url)).text();
+  return skins[url];
+}
+
 let netlist = null;
 let timer = null;
 let frontend = null;   // 'slang' (server) | 'yosys' (wasm in browser)
@@ -297,30 +302,43 @@ function updateModuleList() {
 const SANS = 'ui-sans-serif, -apple-system, "Helvetica Neue", Arial, sans-serif';
 const MONO = '"SF Mono", Menlo, Consolas, monospace';
 
+// Ten curated hues (avoids muddy in-betweens of the raw HSL wheel).
+const HUES = [211, 145, 27, 282, 191, 338, 96, 259, 45, 170];
+
 const THEMES = {
   pastel: {
-    label: 'Pastel',
-    font: SANS, bg: '#ffffff',
-    wire: '#565a6e', wireWidth: 1.1, text: '#1a1a22',
-    marker: '#eceef4', markerStroke: '#565a6e',
-    cellFill: (h) => `hsl(${h} 60% 91%)`,
-    cellStroke: (h) => `hsl(${h} 45% 42%)`,
+    label: 'Pastel', skin: 'skin.svg', shadow: true,
+    font: SANS, bg: '#fafafa',
+    wire: '#5a5e72', wireWidth: 1.1, text: '#1a1a22',
+    marker: '#eef0f6', markerStroke: '#565a6e',
+    cellFill: (i) => `hsl(${HUES[i]} 70% 92%)`,
+    cellStroke: (i) => `hsl(${HUES[i]} 45% 45%)`,
+  },
+  datasheet: {
+    label: 'Datasheet', skin: 'skin.svg', shadow: false,
+    font: MONO, bg: '#f6f5f2',
+    wire: '#3a3a3a', wireWidth: 1.15, text: '#141414',
+    marker: '#ffffff', markerStroke: '#3a3a3a',
+    palette: ['#f2833b', '#f6d84c', '#c4c4c4', '#7fb3d5', '#e77fa3',
+              '#82c99a', '#b39ddb', '#f0b27a', '#76c7c0', '#cabf9f'],
+    cellFill(i) { return this.palette[i]; },
+    cellStroke() { return 'rgba(0,0,0,0.35)'; },
+  },
+  blueprint: {
+    label: 'Blueprint', skin: 'skin.svg', shadow: false,
+    font: SANS, bg: '#153050',
+    wire: '#a9c7e8', wireWidth: 1.1, text: '#eaf2fb',
+    marker: '#1d4066', markerStroke: '#a9c7e8',
+    cellFill: (i) => `hsl(${HUES[i]} 45% 28% / 0.85)`,
+    cellStroke: (i) => `hsl(${HUES[i]} 65% 75%)`,
   },
   classic: {
-    label: 'Classic',
+    label: 'Classic', skin: 'vendor/default.svg', shadow: false,
     font: MONO, bg: '#ffffff',
     wire: '#000000', wireWidth: 1.25, text: '#000000',
     marker: '#ffffff', markerStroke: '#000000',
     cellFill: () => '#ffffff',
     cellStroke: () => '#000000',
-  },
-  blueprint: {
-    label: 'Blueprint',
-    font: SANS, bg: '#153050',
-    wire: '#a9c7e8', wireWidth: 1.1, text: '#eaf2fb',
-    marker: '#1d4066', markerStroke: '#a9c7e8',
-    cellFill: (h) => `hsl(${h} 45% 28% / 0.85)`,
-    cellStroke: (h) => `hsl(${h} 65% 75%)`,
   },
 };
 
@@ -396,26 +414,46 @@ function classifyNet(name) {
 
 function drawNetLabels(svg, mod) {
   const usedClasses = new Set();
+  // Obstacles (cell bodies + already-placed labels) for collision avoidance.
+  const off = svg.getBoundingClientRect();
+  const obstacles = [...svg.querySelectorAll('g[id^="cell_"] rect, text')].map(r => {
+    const b = r.getBoundingClientRect();
+    return { x: b.x - off.x, y: b.y - off.y, w: b.width, h: b.height };
+  });
+  const collides = (x, y, w, h) =>
+    obstacles.some(o => x < o.x + o.w && x + w > o.x && y < o.y + o.h && y + h > o.y);
+
   for (const [name, nn] of Object.entries(mod.netnames || {})) {
     if (nn.hide_name || name.startsWith('$')) continue;
     const id = (nn.bits || []).find(b => typeof b === 'number');
     if (id == null) continue;
     const segs = [...svg.querySelectorAll(`line.${CSS.escape('net_' + id)}`)];
     if (!segs.length) continue;
-    let best = null, bestLen = 0;
-    for (const s of segs) {
+    const shown = name.length * 6.2 + 16;
+    const cands = segs.map(s => {
       const dx = Math.abs(s.x2.baseVal.value - s.x1.baseVal.value);
       const dy = Math.abs(s.y2.baseVal.value - s.y1.baseVal.value);
-      const len = dx + dy + (dx > dy ? 15 : 0);  // prefer horizontal runs
-      if (len > bestLen) { bestLen = len; best = s; }
+      return { s, len: dx + dy + (dx > dy ? 15 : 0) };  // prefer horizontal runs
+    }).sort((a, b) => b.len - a.len);
+    if (!cands.length || cands[0].len < Math.max(60, shown)) continue;
+    let mx = null, my = null;
+    place:
+    for (const c of cands) {
+      if (c.len < Math.max(60, shown)) break;
+      const cx = (c.s.x1.baseVal.value + c.s.x2.baseVal.value) / 2;
+      const cy = (c.s.y1.baseVal.value + c.s.y2.baseVal.value) / 2;
+      for (const dy of [0, -13, 13]) {
+        if (!collides(cx - shown / 2, cy - 7.5 + dy, shown, 15)) {
+          mx = cx; my = cy + dy;
+          break place;
+        }
+      }
+      if (mx === null) { mx = cx; my = cy; }  // fallback: best segment
     }
-    const shown = name.length * 6.2 + 16;
-    if (bestLen < Math.max(70, shown)) continue;  // segment too short to label
+    obstacles.push({ x: mx - shown / 2, y: my - 7.5, w: shown, h: 15 });
     const cls = classifyNet(name);
     const st = ruleStyle(cls.color);
     usedClasses.add(cls.label);
-    const mx = (best.x1.baseVal.value + best.x2.baseVal.value) / 2;
-    const my = (best.y1.baseVal.value + best.y2.baseVal.value) / 2;
     const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
     const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
     rect.setAttribute('x', mx - shown / 2); rect.setAttribute('y', my - 7.5);
@@ -524,36 +562,60 @@ function pruneClockReset(mod) {
   }
 }
 
+const SVGNS = 'http://www.w3.org/2000/svg';
+
 function stylize(mod) {
   const svg = $diagram.querySelector('svg');
   if (!svg) return;
   const t = THEMES[theme];
   document.getElementById('right').style.background = t.bg;
-  const style = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+  const style = document.createElementNS(SVGNS, 'style');
   style.textContent = `
     text { font-family: ${t.font} !important; fill: ${t.text} !important; }
     line { stroke: ${t.wire}; stroke-width: ${t.wireWidth}; stroke-linecap: round; }
-    circle { fill: ${t.wire} !important; }
-    path { fill: ${t.marker}; stroke: ${t.markerStroke}; stroke-width: 1.25; }
+    circle { fill: ${t.wire} !important; r: 2.4px; stroke: ${t.bg}; stroke-width: 1.2; }
+    path { fill: ${t.marker}; stroke: ${t.markerStroke}; stroke-width: 1.25;
+           stroke-linejoin: round; }
+    text.dg-inst { font-size: 8.5px; font-weight: 400; fill: ${t.wire} !important;
+                   text-anchor: middle; }
   `;
   svg.append(style);
+  if (t.shadow) {
+    const defs = document.createElementNS(SVGNS, 'defs');
+    defs.innerHTML = '<filter id="dgshadow" x="-20%" y="-20%" width="140%" height="150%">' +
+      '<feDropShadow dx="0" dy="1" stdDeviation="1.3" flood-color="#000" flood-opacity="0.22"/></filter>';
+    svg.prepend(defs);
+  }
   for (const [inst, cell] of Object.entries(mod.cells || {})) {
     if (cell.type.startsWith('$')) continue;
     const g = svg.querySelector(`#${CSS.escape('cell_' + inst)}`);
     if (!g) continue;
-    const hue = hueOf(cell.type);
+    const idx = hueOf(cell.type) % 10;
     for (const rect of g.querySelectorAll(':scope > rect, rect')) {
-      rect.setAttribute('fill', t.cellFill(hue));
-      rect.setAttribute('stroke', t.cellStroke(hue));
+      rect.setAttribute('fill', t.cellFill(idx));
+      rect.setAttribute('stroke', t.cellStroke(idx));
       rect.setAttribute('stroke-width', '1.5');
-      rect.setAttribute('rx', '3');
+      rect.setAttribute('rx', '4');
+      if (t.shadow) rect.setAttribute('filter', 'url(#dgshadow)');
       break; // only the body rect
+    }
+    // Two-line header: bold type name, dim instance name below it.
+    const typeLabel = g.querySelector('text.nodelabel');
+    if (typeLabel && inst && inst !== cell.type) {
+      typeLabel.setAttribute('y', Number(typeLabel.getAttribute('y')) - 10);
+      const sub = document.createElementNS(SVGNS, 'text');
+      sub.setAttribute('x', typeLabel.getAttribute('x'));
+      sub.setAttribute('y', Number(typeLabel.getAttribute('y')) + 10);
+      sub.setAttribute('class', 'dg-inst');
+      sub.textContent = inst;
+      typeLabel.after(sub);
     }
   }
 }
 
 async function renderModule() {
-  if (!netlist || !skin) return;
+  if (!netlist) return;
+  const skin = await getSkin(THEMES[theme].skin);
   const copy = JSON.parse(JSON.stringify(netlist));
   for (const [name, mod] of Object.entries(copy.modules)) {
     mod.attributes = mod.attributes || {};
@@ -586,7 +648,6 @@ document.getElementById('showLabels').addEventListener('change', renderModule);
 document.getElementById('hideClk').addEventListener('change', renderModule);
 
 (async function init() {
-  skin = await (await fetch('vendor/default.svg')).text();
   const sample = await fetch('sample.sv');
   if (sample.ok) {
     files = [{ name: 'soc.sv', content: await sample.text() }];
