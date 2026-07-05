@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>diagramgen</title>
+<style>
+  :root {
+    --bg: #1e1f24; --panel: #26272e; --border: #3a3b44;
+    --text: #e6e6ea; --dim: #9a9ba6; --accent: #7aa2f7; --err: #f7768e;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; height: 100vh; display: flex; flex-direction: column;
+    background: var(--bg); color: var(--text);
+    font-family: -apple-system, "Helvetica Neue", sans-serif; font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 14px; border-bottom: 1px solid var(--border); flex: none;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .spacer { flex: 1; }
+  select {
+    background: var(--panel); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
+  }
+  #status { color: var(--dim); font-size: 12px; }
+  #status.err { color: var(--err); }
+  main { flex: 1; display: flex; min-height: 0; }
+  #left { width: 42%; min-width: 280px; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+  #src {
+    flex: 1; resize: none; border: 0; outline: none; padding: 12px;
+    background: var(--bg); color: var(--text);
+    font: 12.5px/1.5 "SF Mono", Menlo, monospace; tab-size: 4; white-space: pre;
+  }
+  #errors {
+    display: none; max-height: 35%; overflow: auto; margin: 0; padding: 10px 12px;
+    border-top: 1px solid var(--border); color: var(--err);
+    font: 12px/1.45 "SF Mono", Menlo, monospace; white-space: pre-wrap;
+  }
+  #right { flex: 1; overflow: auto; background: #ffffff; }
+  #diagram { padding: 16px; min-width: fit-content; }
+  #diagram.stale { opacity: 0.4; }
+  #diagram svg { display: block; }
+</style>
+</head>
+<body>
+<header>
+  <h1>diagramgen</h1>
+  <label for="module" style="color:var(--dim)">module:</label>
+  <select id="module"></select>
+  <div class="spacer"></div>
+  <span id="frontend" style="color:var(--dim);font-size:12px"></span>
+  <span id="status"></span>
+</header>
+<main>
+  <div id="left">
+    <textarea id="src" spellcheck="false" placeholder="// SystemVerilog をここに"></textarea>
+    <pre id="errors"></pre>
+  </div>
+  <div id="right"><div id="diagram"></div></div>
+</main>
+<script src="vendor/elk.bundled.js"></script>
+<script src="vendor/netlistsvg.bundle.js"></script>
+<script>
+const $src = document.getElementById('src');
+const $module = document.getElementById('module');
+const $status = document.getElementById('status');
+const $errors = document.getElementById('errors');
+const $diagram = document.getElementById('diagram');
+
+const $frontend = document.getElementById('frontend');
+
+let skin = null;
+let netlist = null;
+let timer = null;
+let frontend = null;   // 'slang' (server) | 'yosys' (wasm in browser)
+let yosysMod = null;
+
+function setStatus(text, isErr = false) {
+  $status.textContent = text;
+  $status.className = isErr ? 'err' : '';
+}
+
+async function detectFrontend() {
+  try {
+    const r = await fetch('api/netlist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source: 'module __probe__(); endmodule' }),
+    });
+    if (r.ok) { frontend = 'slang'; }
+  } catch (e) { /* no server */ }
+  if (!frontend) frontend = 'yosys';
+  $frontend.textContent = frontend === 'slang'
+    ? 'frontend: slang (server)' : 'frontend: yosys (wasm)';
+}
+
+async function compileSlang(source) {
+  const resp = await fetch('api/netlist', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ source, name: 'editor.sv' }),
+  });
+  return resp.json();
+}
+
+const YOSYS_SCRIPT =
+  'read_verilog -sv design.sv; hierarchy -auto-top; proc; delete */t:$*; write_json out.json';
+
+async function compileYosys(source) {
+  if (!yosysMod) {
+    setStatus('yosys-wasm 読み込み中…(初回は数十MBのダウンロード)');
+    yosysMod = await import('./vendor/yowasp/bundle.js');
+  }
+  let stderr = '';
+  const decoder = new TextDecoder();
+  try {
+    const out = await yosysMod.runYosys(
+      ['-q', '-p', YOSYS_SCRIPT],
+      { 'design.sv': source },
+      { stdout: null, stderr: (b) => { if (b) stderr += decoder.decode(b); } },
+    );
+    return { ok: true, netlist: JSON.parse(String(out['out.json'])) };
+  } catch (e) {
+    return { ok: false, error: stderr || String(e) };
+  }
+}
+
+async function compile() {
+  setStatus('コンパイル中…');
+  const result = frontend === 'slang'
+    ? await compileSlang($src.value)
+    : await compileYosys($src.value);
+  if (!result.ok) {
+    $errors.textContent = result.error;
+    $errors.style.display = 'block';
+    $diagram.classList.add('stale');
+    setStatus('エラー', true);
+    return;
+  }
+  $errors.style.display = 'none';
+  netlist = result.netlist;
+  updateModuleList();
+  await renderModule();
+}
+
+function updateModuleList() {
+  const names = Object.keys(netlist.modules);
+  const prev = $module.value;
+  $module.innerHTML = '';
+  for (const name of names) {
+    const opt = document.createElement('option');
+    opt.value = opt.textContent = name;
+    $module.appendChild(opt);
+  }
+  if (names.includes(prev)) {
+    $module.value = prev;
+  } else {
+    const top = names.find(n => netlist.modules[n].attributes?.top);
+    $module.value = top ?? names[0];
+  }
+}
+
+async function renderModule() {
+  if (!netlist || !skin) return;
+  const copy = JSON.parse(JSON.stringify(netlist));
+  for (const [name, mod] of Object.entries(copy.modules)) {
+    mod.attributes = mod.attributes || {};
+    mod.attributes.top = name === $module.value ? 1 : 0;
+  }
+  try {
+    const svg = await netlistsvg.render(skin, copy);
+    $diagram.innerHTML = svg;
+    $diagram.classList.remove('stale');
+    setStatus('OK');
+  } catch (e) {
+    setStatus('レイアウト失敗: ' + e.message, true);
+  }
+}
+
+$src.addEventListener('input', () => {
+  clearTimeout(timer);
+  timer = setTimeout(compile, 500);
+});
+$module.addEventListener('change', renderModule);
+
+(async function init() {
+  skin = await (await fetch('vendor/default.svg')).text();
+  const sample = await fetch('sample.sv');
+  if (sample.ok) $src.value = await sample.text();
+  await detectFrontend();
+  await compile();
+})();
+</script>
+</body>
+</html>

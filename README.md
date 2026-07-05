@@ -1,0 +1,67 @@
+# diagramgen
+
+Verilog/SystemVerilog からブロック図(モジュール階層+ポート接続)を生成するツール。
+
+## パイプライン
+
+```
+SystemVerilog --(slang/pyslang エラボレーション)--> Yosys互換JSON --(netlistsvg/ELK)--> SVG
+```
+
+- **フロントエンド**: [slang](https://github.com/MikePopoloski/slang) の Python バインディング
+  [pyslang](https://pypi.org/project/pyslang/)。合成は行わず、エラボレーション結果から
+  インスタンス階層とポート接続だけを抽出する(Yosys 不要)。
+- **中間フォーマット**: Yosys `write_json` 互換の JSON。netlistsvg / d3-hwschematic /
+  DigitalJS などの既存ツールがそのまま読める。他の合成系・フロントエンドからの
+  コンバータもこの形式に合わせればよい。
+- **レイアウト/描画**: 当面は [netlistsvg](https://github.com/nturley/netlistsvg)
+  (内部は elkjs = Eclipse Layout Kernel)。将来的に自作レイアウトエンジンへ差し替え予定。
+
+## セットアップ
+
+```sh
+python3 -m venv .venv && .venv/bin/pip install pyslang
+npm install
+```
+
+## 使い方
+
+### Web UI(ブラウザでライブ編集)
+
+```sh
+make serve   # → http://127.0.0.1:8000/
+```
+
+左ペインで SystemVerilog を編集すると 0.5 秒デバウンスで自動再コンパイルし、
+右ペインにブロック図を再描画する。ヘッダのドロップダウンで表示するモジュールを
+切り替えられる。コンパイルエラーは行番号付きで左下に表示される。
+サーバーは標準ライブラリのみ(slang の実行以外はブラウザ内で完結)。
+
+### CLI(SVG ファイル生成)
+
+```sh
+make                # rtl/*.sv すべてを build/*.svg に変換
+open build/soc.svg  # 生成結果を見る
+```
+
+個別に実行する場合:
+
+```sh
+PYTHONPATH=src .venv/bin/python -m diagramgen.cli rtl/soc.sv --top top -o build/soc.json
+./node_modules/.bin/netlistsvg build/soc.json -o build/soc.svg
+```
+
+## 現状の制限(MVP)
+
+- バスは 1 本のネットに集約(ビット単位の追跡はしない)
+- ポート接続式の select / concat は信号全体に丸める
+- interface ポート、インスタンス配列、generate ブロックは未対応
+- `assign` によるネット間エイリアスは統合しない
+
+## ロードマップ
+
+1. ✅ slang → Yosys互換JSON → netlistsvg の最小チェーン
+2. 階層の折り畳み/展開(モジュール単位の深さ制御 `--depth`)
+3. ビットレベルのネット追跡(select/concat の正確な表現、バス分岐の描画)
+4. レイアウトエンジンの自作(ポート制約付き Sugiyama + 直交ハイパーエッジ
+   ルーティング)を独立ライブラリとして切り出し

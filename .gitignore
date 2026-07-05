@@ -1,0 +1,9 @@
+node_modules/
+.venv/
+build/
+__pycache__/
+*.pyc
+web/vendor/
+web/sample.sv
+.claude/
+.DS_Store
