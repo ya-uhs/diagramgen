@@ -3,8 +3,25 @@
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from .netlist import extract_design
+
+RTL_SUFFIXES = (".sv", ".v")
+
+
+def collect_files(paths):
+    """Expand directories into contained RTL files, recursively."""
+    files = []
+    for p in paths:
+        path = Path(p)
+        if path.is_dir():
+            files.extend(
+                str(f) for f in sorted(path.rglob("*")) if f.suffix in RTL_SUFFIXES
+            )
+        else:
+            files.append(p)
+    return files
 
 
 def main(argv=None) -> int:
@@ -12,13 +29,19 @@ def main(argv=None) -> int:
         prog="diagramgen",
         description="Generate a Yosys-JSON-compatible netlist from SystemVerilog",
     )
-    parser.add_argument("files", nargs="+", help="SystemVerilog source files")
+    parser.add_argument("files", nargs="+",
+                        help="SystemVerilog source files or directories")
     parser.add_argument("--top", help="top module name (default: auto-detect)")
     parser.add_argument("-o", "--output", help="output JSON path (default: stdout)")
     args = parser.parse_args(argv)
 
+    files = collect_files(args.files)
+    if not files:
+        print("error: no RTL files found", file=sys.stderr)
+        return 1
+
     try:
-        design = extract_design(args.files, top=args.top)
+        design = extract_design(files, top=args.top)
     except RuntimeError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1

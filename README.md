@@ -50,11 +50,25 @@ make serve   # → http://127.0.0.1:8000/
 切り替えられる。コンパイルエラーは行番号付きで左下に表示される。
 サーバーは標準ライブラリのみ(slang の実行以外はブラウザ内で完結)。
 
+- **複数ファイル/フォルダ**: 「ファイルを開く」「フォルダを開く」ボタン、
+  またはエディタへのドラッグ&ドロップで RTL 一式(.v/.sv)を読み込める。
+  ファイルはタブで切り替え、コンパイルは常に全ファイル一括。
+- **色分け**: インスタンスの箱はモジュール型ごとに自動で色分けされる
+  (同じ型は同じ色)。配色ロジックは `web/index.html` の `stylize()` にあり、
+  枠線・角丸・フォントもここで変更できる。箱の形状自体を変えたい場合は
+  netlistsvg のスキン(`web/vendor/default.svg`)を差し替える。
+
 ### CLI(SVG ファイル生成)
 
 ```sh
 make                # rtl/*.sv すべてを build/*.svg に変換
 open build/soc.svg  # 生成結果を見る
+```
+
+CLI はファイルの代わりにディレクトリも受け付ける(再帰的に .sv/.v を収集):
+
+```sh
+PYTHONPATH=src .venv/bin/python -m diagramgen.cli path/to/rtl_dir --top soc -o build/soc.json
 ```
 
 個別に実行する場合:

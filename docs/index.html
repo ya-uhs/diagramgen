@@ -21,19 +21,33 @@
   }
   header h1 { font-size: 15px; margin: 0; font-weight: 600; }
   header .spacer { flex: 1; }
-  select {
+  select, button {
     background: var(--panel); color: var(--text);
-    border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px;
+    border: 1px solid var(--border); border-radius: 6px; padding: 4px 10px;
+    font-size: 13px; cursor: pointer;
   }
+  button:hover { border-color: var(--accent); }
   #status { color: var(--dim); font-size: 12px; }
   #status.err { color: var(--err); }
+  #frontend { color: var(--dim); font-size: 12px; }
   main { flex: 1; display: flex; min-height: 0; }
   #left { width: 42%; min-width: 280px; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+  #tabs {
+    display: flex; overflow-x: auto; flex: none; background: var(--panel);
+    border-bottom: 1px solid var(--border); scrollbar-width: thin;
+  }
+  #tabs .tab {
+    padding: 6px 12px; font-size: 12px; color: var(--dim); cursor: pointer;
+    border-right: 1px solid var(--border); white-space: nowrap;
+    font-family: "SF Mono", Menlo, monospace;
+  }
+  #tabs .tab.active { color: var(--text); background: var(--bg); }
   #src {
     flex: 1; resize: none; border: 0; outline: none; padding: 12px;
     background: var(--bg); color: var(--text);
     font: 12.5px/1.5 "SF Mono", Menlo, monospace; tab-size: 4; white-space: pre;
   }
+  #src.dragover { outline: 2px dashed var(--accent); outline-offset: -6px; }
   #errors {
     display: none; max-height: 35%; overflow: auto; margin: 0; padding: 10px 12px;
     border-top: 1px solid var(--border); color: var(--err);
@@ -48,15 +62,20 @@
 <body>
 <header>
   <h1>diagramgen</h1>
+  <button id="openFiles">ファイルを開く</button>
+  <button id="openDir">フォルダを開く</button>
   <label for="module" style="color:var(--dim)">module:</label>
   <select id="module"></select>
   <div class="spacer"></div>
-  <span id="frontend" style="color:var(--dim);font-size:12px"></span>
+  <span id="frontend"></span>
   <span id="status"></span>
+  <input type="file" id="pickFiles" multiple accept=".v,.sv,.svh,.vh" hidden>
+  <input type="file" id="pickDir" webkitdirectory hidden>
 </header>
 <main>
   <div id="left">
-    <textarea id="src" spellcheck="false" placeholder="// SystemVerilog をここに"></textarea>
+    <div id="tabs"></div>
+    <textarea id="src" spellcheck="false" placeholder="// SystemVerilog をここに(ファイルのドロップも可)"></textarea>
     <pre id="errors"></pre>
   </div>
   <div id="right"><div id="diagram"></div></div>
@@ -65,11 +84,11 @@
 <script src="vendor/netlistsvg.bundle.js"></script>
 <script>
 const $src = document.getElementById('src');
+const $tabs = document.getElementById('tabs');
 const $module = document.getElementById('module');
 const $status = document.getElementById('status');
 const $errors = document.getElementById('errors');
 const $diagram = document.getElementById('diagram');
-
 const $frontend = document.getElementById('frontend');
 
 let skin = null;
@@ -77,11 +96,60 @@ let netlist = null;
 let timer = null;
 let frontend = null;   // 'slang' (server) | 'yosys' (wasm in browser)
 let yosysMod = null;
+let files = [{ name: 'design.sv', content: '' }];
+let active = 0;
 
 function setStatus(text, isErr = false) {
   $status.textContent = text;
   $status.className = isErr ? 'err' : '';
 }
+
+// ---- file tabs -------------------------------------------------------
+
+function syncActive() { files[active].content = $src.value; }
+
+function renderTabs() {
+  $tabs.innerHTML = '';
+  files.forEach((f, i) => {
+    const el = document.createElement('div');
+    el.className = 'tab' + (i === active ? ' active' : '');
+    el.textContent = f.name;
+    el.onclick = () => { syncActive(); active = i; $src.value = f.content; renderTabs(); };
+    $tabs.appendChild(el);
+  });
+  $tabs.style.display = files.length > 1 ? 'flex' : 'none';
+}
+
+const RTL_EXT = /\.(sv|v|svh|vh)$/i;
+
+async function loadFileList(fileList) {
+  const picked = [...fileList].filter(f => RTL_EXT.test(f.name));
+  if (!picked.length) { setStatus('RTLファイル(.v/.sv)が見つかりません', true); return; }
+  files = await Promise.all(picked.map(async f => ({
+    name: (f.webkitRelativePath || f.name).replace(/[^\w./-]/g, '_'),
+    content: await f.text(),
+  })));
+  files.sort((a, b) => a.name.localeCompare(b.name));
+  active = 0;
+  $src.value = files[0].content;
+  renderTabs();
+  await compile();
+}
+
+document.getElementById('openFiles').onclick = () => document.getElementById('pickFiles').click();
+document.getElementById('openDir').onclick = () => document.getElementById('pickDir').click();
+document.getElementById('pickFiles').onchange = (e) => loadFileList(e.target.files);
+document.getElementById('pickDir').onchange = (e) => loadFileList(e.target.files);
+
+$src.addEventListener('dragover', (e) => { e.preventDefault(); $src.classList.add('dragover'); });
+$src.addEventListener('dragleave', () => $src.classList.remove('dragover'));
+$src.addEventListener('drop', async (e) => {
+  e.preventDefault();
+  $src.classList.remove('dragover');
+  if (e.dataTransfer.files.length) await loadFileList(e.dataTransfer.files);
+});
+
+// ---- frontends -------------------------------------------------------
 
 async function detectFrontend() {
   try {
@@ -97,29 +165,34 @@ async function detectFrontend() {
     ? 'frontend: slang (server)' : 'frontend: yosys (wasm)';
 }
 
-async function compileSlang(source) {
+async function compileSlang(sources) {
   const resp = await fetch('api/netlist', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source, name: 'editor.sv' }),
+    body: JSON.stringify({ files: sources }),
   });
   return resp.json();
 }
 
-const YOSYS_SCRIPT =
-  'read_verilog -sv design.sv; hierarchy -auto-top; proc; delete */t:$*; write_json out.json';
-
-async function compileYosys(source) {
+async function compileYosys(sources) {
   if (!yosysMod) {
     setStatus('yosys-wasm 読み込み中…(初回は数十MBのダウンロード)');
     yosysMod = await import('./vendor/yowasp/bundle.js');
   }
+  const fsFiles = {};
+  const names = [];
+  for (const f of sources) {
+    const name = f.name.replaceAll('/', '_');
+    fsFiles[name] = f.content;
+    names.push(name);
+  }
+  const script = `read_verilog -sv ${names.join(' ')}; ` +
+    'hierarchy -auto-top; proc; delete */t:$*; write_json out.json';
   let stderr = '';
   const decoder = new TextDecoder();
   try {
     const out = await yosysMod.runYosys(
-      ['-q', '-p', YOSYS_SCRIPT],
-      { 'design.sv': source },
+      ['-q', '-p', script], fsFiles,
       { stdout: null, stderr: (b) => { if (b) stderr += decoder.decode(b); } },
     );
     return { ok: true, netlist: JSON.parse(String(out['out.json'])) };
@@ -128,11 +201,15 @@ async function compileYosys(source) {
   }
 }
 
+// ---- compile & render ------------------------------------------------
+
 async function compile() {
+  syncActive();
   setStatus('コンパイル中…');
+  const sources = files.map(f => ({ name: f.name, content: f.content }));
   const result = frontend === 'slang'
-    ? await compileSlang($src.value)
-    : await compileYosys($src.value);
+    ? await compileSlang(sources)
+    : await compileYosys(sources);
   if (!result.ok) {
     $errors.textContent = result.error;
     $errors.style.display = 'block';
@@ -158,8 +235,40 @@ function updateModuleList() {
   if (names.includes(prev)) {
     $module.value = prev;
   } else {
-    const top = names.find(n => netlist.modules[n].attributes?.top);
+    const top = names.find(n => Number(netlist.modules[n].attributes?.top) === 1
+      || /1$/.test(String(netlist.modules[n].attributes?.top ?? '')));
     $module.value = top ?? names[0];
+  }
+}
+
+// Deterministic pastel color per module type.
+function hueOf(name) {
+  let h = 0;
+  for (const c of name) h = (h * 31 + c.codePointAt(0)) >>> 0;
+  return h % 360;
+}
+
+function stylize(mod) {
+  const svg = $diagram.querySelector('svg');
+  if (!svg) return;
+  const style = document.createElementNS('http://www.w3.org/2000/svg', 'style');
+  style.textContent = `
+    text { font-family: ui-sans-serif, -apple-system, "Helvetica Neue", sans-serif; }
+    line, path { stroke-linecap: round; }
+  `;
+  svg.prepend(style);
+  for (const [inst, cell] of Object.entries(mod.cells || {})) {
+    if (cell.type.startsWith('$')) continue;
+    const g = svg.querySelector(`#${CSS.escape('cell_' + inst)}`);
+    if (!g) continue;
+    const hue = hueOf(cell.type);
+    for (const rect of g.querySelectorAll(':scope > rect, rect')) {
+      rect.setAttribute('fill', `hsl(${hue} 60% 91%)`);
+      rect.setAttribute('stroke', `hsl(${hue} 45% 42%)`);
+      rect.setAttribute('stroke-width', '1.5');
+      rect.setAttribute('rx', '3');
+      break; // only the body rect
+    }
   }
 }
 
@@ -173,6 +282,7 @@ async function renderModule() {
   try {
     const svg = await netlistsvg.render(skin, copy);
     $diagram.innerHTML = svg;
+    stylize(copy.modules[$module.value]);
     $diagram.classList.remove('stale');
     setStatus('OK');
   } catch (e) {
@@ -189,7 +299,11 @@ $module.addEventListener('change', renderModule);
 (async function init() {
   skin = await (await fetch('vendor/default.svg')).text();
   const sample = await fetch('sample.sv');
-  if (sample.ok) $src.value = await sample.text();
+  if (sample.ok) {
+    files = [{ name: 'soc.sv', content: await sample.text() }];
+    $src.value = files[0].content;
+  }
+  renderTabs();
   await detectFrontend();
   await compile();
 })();

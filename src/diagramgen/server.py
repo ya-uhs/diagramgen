@@ -9,7 +9,7 @@ import shutil
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .netlist import extract_design_from_text
+from .netlist import extract_design_from_sources
 
 ROOT = Path(__file__).resolve().parents[2]
 WEB_DIR = ROOT / "web"
@@ -44,11 +44,11 @@ class Handler(SimpleHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         try:
             req = json.loads(self.rfile.read(length))
-            design = extract_design_from_text(
-                req.get("source", ""),
-                name=req.get("name", "input.sv"),
-                top=req.get("top"),
-            )
+            if "files" in req:
+                sources = [(f["name"], f["content"]) for f in req["files"]]
+            else:
+                sources = [(req.get("name", "input.sv"), req.get("source", ""))]
+            design = extract_design_from_sources(sources, top=req.get("top"))
             payload = {"ok": True, "netlist": design}
         except RuntimeError as e:
             payload = {"ok": False, "error": str(e)}

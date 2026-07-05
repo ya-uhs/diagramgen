@@ -128,27 +128,34 @@ def _render_diagnostics(diags, source_manager) -> str:
 
 def extract_design(files: List[str], top: Optional[str] = None) -> dict:
     """Elaborate `files` with slang and return a Yosys-JSON-compatible dict."""
-    trees = [SyntaxTree.fromFile(path) for path in files]
-    return _extract_from_trees(trees, top)
+    sources = []
+    for path in files:
+        with open(path) as f:
+            sources.append((path, f.read()))
+    return extract_design_from_sources(sources, top)
+
+
+def extract_design_from_sources(sources, top: Optional[str] = None) -> dict:
+    """Like extract_design, but for in-memory buffers: iterable of (name, text)."""
+    sm = pyslang.SourceManager()
+    trees = [SyntaxTree.fromText(text, sm, name, name) for name, text in sources]
+    return _extract_from_trees(trees, top, sm)
 
 
 def extract_design_from_text(text: str, name: str = "input.sv",
                              top: Optional[str] = None) -> dict:
-    """Like extract_design, but for an in-memory source buffer."""
-    return _extract_from_trees([SyntaxTree.fromText(text, name)], top)
+    """Like extract_design, but for a single in-memory source buffer."""
+    return extract_design_from_sources([(name, text)], top)
 
 
-def _extract_from_trees(trees, top: Optional[str]) -> dict:
+def _extract_from_trees(trees, top: Optional[str], source_manager) -> dict:
     comp = A.Compilation()
     for tree in trees:
         comp.addSyntaxTree(tree)
 
     errors = [d for d in comp.getAllDiagnostics() if d.isError()]
     if errors:
-        if len(trees) == 1:
-            raise RuntimeError(_render_diagnostics(errors, trees[0].sourceManager))
-        msgs = "\n".join(str(e.code) for e in errors[:10])
-        raise RuntimeError(f"slang reported errors:\n{msgs}")
+        raise RuntimeError(_render_diagnostics(errors, source_manager))
 
     top_instances = list(comp.getRoot().topInstances)
     if not top_instances:
