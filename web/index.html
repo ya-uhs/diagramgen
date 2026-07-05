@@ -57,10 +57,28 @@
     color: var(--dim); font-size: 12px; display: flex; align-items: center;
     gap: 4px; cursor: pointer; white-space: nowrap;
   }
-  #right { flex: 1; overflow: auto; background: #ffffff; position: relative; }
+  #right { flex: 1; overflow: hidden; background: #ffffff; position: relative; }
+  #diagramWrap { position: absolute; inset: 0; overflow: hidden; cursor: grab; }
+  #diagramWrap.panning { cursor: grabbing; }
+  #diagram svg { transform-origin: 0 0; }
+  #diagram svg g[id^="cell_"] { cursor: pointer; }
+  #diagram svg line.hi { stroke: #ff5d8f !important; stroke-width: 2.4 !important; }
+  #toolbar {
+    position: absolute; top: 10px; right: 10px; z-index: 5;
+    display: flex; gap: 6px; padding: 5px 7px;
+    background: rgba(30,31,36,.88); border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  #toolbar button { padding: 3px 9px; font-size: 12px; }
+  #tooltip {
+    position: fixed; z-index: 20; display: none; pointer-events: none;
+    background: rgba(20,20,26,.94); color: #eee; padding: 3px 9px;
+    border-radius: 6px; font: 12px "SF Mono", Menlo, monospace;
+  }
+  #errors .errloc { text-decoration: underline; cursor: pointer; }
   #legend {
-    position: sticky; left: 12px; bottom: 12px; display: inline-flex; gap: 12px;
-    padding: 6px 12px; margin: 12px; background: rgba(255,255,255,.92);
+    position: absolute; left: 12px; bottom: 12px; display: inline-flex; gap: 12px;
+    padding: 6px 12px; background: rgba(255,255,255,.92); z-index: 5;
     border: 1px solid #ccc; border-radius: 6px; font-size: 11px; color: #222;
     align-items: center; width: max-content;
   }
@@ -94,7 +112,6 @@
     width: 70px; background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 6px; padding: 4px 6px;
   }
-  #diagram { padding: 16px; min-width: fit-content; }
   #diagram.stale { opacity: 0.4; }
   #diagram svg { display: block; }
 </style>
@@ -137,6 +154,7 @@
     <label>ラベル最小配線長 (px) <input type="number" id="setMinSeg" min="0" max="500" step="10"></label>
   </div>
   <div class="dlg-actions">
+    <button id="resetSrc" title="エディタの内容を破棄してサンプルを読み込む">サンプルに戻す</button>
     <button id="closeRules">閉じる</button>
   </div>
 </dialog>
@@ -146,8 +164,19 @@
     <textarea id="src" spellcheck="false" placeholder="// SystemVerilog をここに(ファイルのドロップも可)"></textarea>
     <pre id="errors"></pre>
   </div>
-  <div id="right"><div id="diagram"></div></div>
+  <div id="right">
+    <div id="toolbar">
+      <button id="navBack" style="display:none" title="上の階層へ戻る">← 戻る</button>
+      <button id="zoomOut" title="縮小">−</button>
+      <button id="zoomFit" title="全体表示">Fit</button>
+      <button id="zoomIn" title="拡大">+</button>
+      <button id="dlSvg" title="SVGをダウンロード">SVG</button>
+      <button id="dlPng" title="PNGをダウンロード">PNG</button>
+    </div>
+    <div id="diagramWrap"><div id="diagram"></div></div>
+  </div>
 </main>
+<div id="tooltip"></div>
 <script src="vendor/elk.bundled.js"></script>
 <script src="vendor/netlistsvg.bundle.js"></script>
 <script>
@@ -172,6 +201,13 @@ let yosysMod = null;
 let files = [{ name: 'design.sv', content: '' }];
 let active = 0;
 
+// View state for pan/zoom, hierarchy navigation and hover lookups.
+const view = { s: 1, tx: 16, ty: 16 };
+let fitPending = true;
+let currentModule = null;         // module data of the rendered diagram
+const netNameById = new Map();    // net id -> display name
+const navStack = [];              // for drill-down "back"
+
 function setStatus(text, isErr = false) {
   $status.textContent = text;
   $status.className = isErr ? 'err' : '';
@@ -180,6 +216,25 @@ function setStatus(text, isErr = false) {
 // ---- file tabs -------------------------------------------------------
 
 function syncActive() { files[active].content = $src.value; }
+
+function persistSrc() {
+  syncActive();
+  try {
+    localStorage.setItem('diagramgen-src', JSON.stringify({ files, active }));
+  } catch (e) { /* quota exceeded: skip persistence */ }
+}
+
+function restoreSrc() {
+  try {
+    const saved = JSON.parse(localStorage.getItem('diagramgen-src'));
+    if (saved && Array.isArray(saved.files) && saved.files.length) {
+      files = saved.files;
+      active = Math.min(saved.active || 0, files.length - 1);
+      return true;
+    }
+  } catch (e) { /* corrupted: ignore */ }
+  return false;
+}
 
 function renderTabs() {
   $tabs.innerHTML = '';
@@ -206,6 +261,8 @@ async function loadFileList(fileList) {
   active = 0;
   $src.value = files[0].content;
   renderTabs();
+  persistSrc();
+  fitPending = true;
   await compile();
 }
 
@@ -284,7 +341,7 @@ async function compile() {
     ? await compileSlang(sources)
     : await compileYosys(sources);
   if (!result.ok) {
-    $errors.textContent = result.error;
+    showErrors(result.error);
     $errors.style.display = 'block';
     $diagram.classList.add('stale');
     setStatus('エラー', true);
@@ -630,6 +687,14 @@ document.getElementById('setMinSeg').onchange = (e) => {
   saveSettings();
   renderModule();
 };
+document.getElementById('resetSrc').onclick = async () => {
+  localStorage.removeItem('diagramgen-src');
+  await loadSample();
+  renderTabs();
+  fitPending = true;
+  document.getElementById('rulesDlg').close();
+  await compile();
+};
 document.getElementById('closeRules').onclick = () =>
   document.getElementById('rulesDlg').close();
 
@@ -767,6 +832,9 @@ async function doRenderModule() {
       legendNet.clear();
     }
     renderLegend();
+    currentModule = mod;
+    buildNetNames(mod);
+    if (fitPending) { fitPending = false; fitView(); } else { applyView(); }
     $diagram.classList.remove('stale');
     setStatus('OK');
   } catch (e) {
@@ -774,19 +842,257 @@ async function doRenderModule() {
   }
 }
 
+function buildNetNames(mod) {
+  netNameById.clear();
+  for (const [name, nn] of Object.entries(mod.netnames || {})) {
+    if (nn.hide_name || name.startsWith('$')) continue;
+    for (const b of nn.bits || []) {
+      if (typeof b === 'number' && !netNameById.has(b)) netNameById.set(b, name);
+    }
+  }
+}
+
+// ---- pan / zoom --------------------------------------------------------
+
+const $wrap = document.getElementById('diagramWrap');
+
+function applyView() {
+  const svg = $diagram.querySelector('svg');
+  if (svg) svg.style.transform =
+    `translate(${view.tx}px, ${view.ty}px) scale(${view.s})`;
+}
+
+function svgSize() {
+  const svg = $diagram.querySelector('svg');
+  if (!svg) return null;
+  return { w: Number(svg.getAttribute('width')) || svg.getBBox().width,
+           h: Number(svg.getAttribute('height')) || svg.getBBox().height };
+}
+
+function fitView() {
+  const dim = svgSize();
+  if (!dim) return;
+  const pw = $wrap.clientWidth, ph = $wrap.clientHeight;
+  view.s = Math.min((pw - 40) / dim.w, (ph - 40) / dim.h, 1.5);
+  view.tx = (pw - dim.w * view.s) / 2;
+  view.ty = (ph - dim.h * view.s) / 2;
+  applyView();
+}
+
+function zoomAt(px, py, factor) {
+  const s = Math.min(8, Math.max(0.05, view.s * factor));
+  const real = s / view.s;
+  view.tx = px - real * (px - view.tx);
+  view.ty = py - real * (py - view.ty);
+  view.s = s;
+  applyView();
+}
+
+$wrap.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const r = $wrap.getBoundingClientRect();
+  zoomAt(e.clientX - r.left, e.clientY - r.top, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+}, { passive: false });
+
+let pan = null;
+$wrap.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  pan = { x: e.clientX, y: e.clientY };
+  $wrap.classList.add('panning');
+});
+window.addEventListener('mousemove', (e) => {
+  if (!pan) return;
+  view.tx += e.clientX - pan.x;
+  view.ty += e.clientY - pan.y;
+  pan = { x: e.clientX, y: e.clientY };
+  applyView();
+});
+window.addEventListener('mouseup', () => {
+  pan = null;
+  $wrap.classList.remove('panning');
+});
+
+document.getElementById('zoomIn').onclick = () =>
+  zoomAt($wrap.clientWidth / 2, $wrap.clientHeight / 2, 1.25);
+document.getElementById('zoomOut').onclick = () =>
+  zoomAt($wrap.clientWidth / 2, $wrap.clientHeight / 2, 1 / 1.25);
+document.getElementById('zoomFit').onclick = fitView;
+
+// ---- net hover highlight -----------------------------------------------
+
+const $tooltip = document.getElementById('tooltip');
+let hiClass = null;
+
+function clearHighlight() {
+  if (!hiClass) return;
+  for (const el of $diagram.querySelectorAll('line.hi')) el.classList.remove('hi');
+  hiClass = null;
+  $tooltip.style.display = 'none';
+}
+
+$diagram.addEventListener('mouseover', (e) => {
+  const line = e.target.closest('line');
+  if (!line) { clearHighlight(); return; }
+  const cls = [...line.classList].find(c => c.startsWith('net_'));
+  if (!cls || cls === hiClass) return;
+  clearHighlight();
+  hiClass = cls;
+  for (const el of $diagram.querySelectorAll(`line.${CSS.escape(cls)}`)) {
+    el.classList.add('hi');
+  }
+  const name = netNameById.get(Number(cls.slice(4)));
+  if (name) {
+    $tooltip.textContent = name;
+    $tooltip.style.display = 'block';
+  }
+});
+$diagram.addEventListener('mousemove', (e) => {
+  if ($tooltip.style.display === 'block') {
+    $tooltip.style.left = (e.clientX + 14) + 'px';
+    $tooltip.style.top = (e.clientY + 14) + 'px';
+  }
+});
+$diagram.addEventListener('mouseleave', clearHighlight);
+
+// ---- hierarchy drill-down ----------------------------------------------
+
+function updateBackBtn() {
+  document.getElementById('navBack').style.display =
+    navStack.length ? '' : 'none';
+}
+
+$diagram.addEventListener('dblclick', (e) => {
+  const g = e.target.closest('g[id^="cell_"]');
+  if (!g || !currentModule) return;
+  const cell = (currentModule.cells || {})[g.id.slice(5)];
+  if (!cell || !netlist.modules[cell.type]) return;
+  navStack.push($module.value);
+  $module.value = cell.type;
+  fitPending = true;
+  updateBackBtn();
+  renderModule();
+});
+
+document.getElementById('navBack').onclick = () => {
+  const prev = navStack.pop();
+  if (prev && netlist.modules[prev]) {
+    $module.value = prev;
+    fitPending = true;
+    renderModule();
+  }
+  updateBackBtn();
+};
+
+// ---- download ----------------------------------------------------------
+
+function svgText() {
+  const svg = $diagram.querySelector('svg');
+  if (!svg) return null;
+  const clone = svg.cloneNode(true);
+  clone.style.transform = '';
+  return new XMLSerializer().serializeToString(clone);
+}
+
+function download(blob, name) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+document.getElementById('dlSvg').onclick = () => {
+  const text = svgText();
+  if (text) download(new Blob([text], { type: 'image/svg+xml' }),
+                     `${$module.value}.svg`);
+};
+
+document.getElementById('dlPng').onclick = () => {
+  const text = svgText();
+  const dim = svgSize();
+  if (!text || !dim) return;
+  const img = new Image();
+  const url = URL.createObjectURL(new Blob([text], { type: 'image/svg+xml' }));
+  img.onload = () => {
+    const scale = 2;
+    const canvas = document.createElement('canvas');
+    canvas.width = dim.w * scale;
+    canvas.height = dim.h * scale;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = THEMES[theme].bg;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.scale(scale, scale);
+    ctx.drawImage(img, 0, 0);
+    URL.revokeObjectURL(url);
+    canvas.toBlob(b => download(b, `${$module.value}.png`), 'image/png');
+  };
+  img.src = url;
+};
+
+// ---- clickable error locations -----------------------------------------
+
+function showErrors(text) {
+  $errors.innerHTML = '';
+  const re = /(\S+?):(\d+):(\d+)/g;
+  let last = 0, m;
+  while ((m = re.exec(text)) !== null) {
+    $errors.append(text.slice(last, m.index));
+    const a = document.createElement('span');
+    a.className = 'errloc';
+    a.textContent = m[0];
+    a.dataset.file = m[1]; a.dataset.line = m[2]; a.dataset.col = m[3];
+    $errors.appendChild(a);
+    last = m.index + m[0].length;
+  }
+  $errors.append(text.slice(last));
+}
+
+$errors.addEventListener('click', (e) => {
+  const loc = e.target.closest('.errloc');
+  if (!loc) return;
+  const idx = files.findIndex(f =>
+    f.name === loc.dataset.file || f.name.endsWith('/' + loc.dataset.file));
+  if (idx >= 0 && idx !== active) {
+    syncActive();
+    active = idx;
+    $src.value = files[active].content;
+    renderTabs();
+  }
+  const line = Number(loc.dataset.line), col = Number(loc.dataset.col);
+  const lines = $src.value.split('\n');
+  let off = 0;
+  for (let i = 0; i < line - 1 && i < lines.length; i++) off += lines[i].length + 1;
+  off += col - 1;
+  $src.focus();
+  $src.setSelectionRange(off, off);
+  const lineHeight = 12.5 * 1.5;
+  $src.scrollTop = Math.max(0, (line - 1) * lineHeight - $src.clientHeight / 3);
+});
+
+// ---- wiring ------------------------------------------------------------
+
 $src.addEventListener('input', () => {
   clearTimeout(timer);
-  timer = setTimeout(compile, settings.debounceMs);
+  timer = setTimeout(() => { persistSrc(); compile(); }, settings.debounceMs);
 });
-$module.addEventListener('change', renderModule);
+$module.addEventListener('change', () => { fitPending = true; renderModule(); });
 document.getElementById('showLabels').addEventListener('change', renderModule);
 document.getElementById('hideClk').addEventListener('change', renderModule);
 
-(async function init() {
+async function loadSample() {
   const sample = await fetch('sample.sv');
   if (sample.ok) {
     files = [{ name: 'soc.sv', content: await sample.text() }];
+    active = 0;
     $src.value = files[0].content;
+  }
+}
+
+(async function init() {
+  if (restoreSrc()) {
+    $src.value = files[active].content;
+  } else {
+    await loadSample();
   }
   renderTabs();
   await detectFrontend();

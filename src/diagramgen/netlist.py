@@ -93,12 +93,30 @@ def _extract_module(inst_body) -> dict:
                 "direction": _DIRECTION.get(member.direction, "input"),
                 "bits": [nets.id_for(member.internalSymbol.name)],
             }
+        elif member.kind == A.SymbolKind.InterfacePort:
+            # An interface port is a whole signal bundle; model it as one net.
+            ports[member.name] = {
+                "direction": "inout",
+                "bits": [nets.id_for(member.name)],
+            }
         elif member.kind == A.SymbolKind.Instance:
+            if member.definition.definitionKind != A.DefinitionKind.Module:
+                # Interface (or program) instances behave like nets: every
+                # module port bound to them connects to this single id.
+                nets.id_for(member.name)
+                continue
             connections = {}
             directions = {}
             for pc in member.portConnections:
+                if pc.port.kind == A.SymbolKind.InterfacePort:
+                    iface, _modport = pc.ifaceConn
+                    if iface is None:
+                        continue
+                    directions[pc.port.name] = "inout"
+                    connections[pc.port.name] = [nets.id_for(iface.name)]
+                    continue
                 if pc.port.kind != A.SymbolKind.Port:
-                    continue  # interface port etc.
+                    continue
                 directions[pc.port.name] = _DIRECTION.get(pc.port.direction, "input")
                 tokens = _resolve(pc.expression, nets) if pc.expression else None
                 if tokens is None:
@@ -177,7 +195,8 @@ def _extract_from_trees(trees, top: Optional[str], source_manager) -> dict:
         if is_top:
             modules[name]["attributes"] = {"top": 1}
         for member in inst.body:
-            if member.kind == A.SymbolKind.Instance:
+            if (member.kind == A.SymbolKind.Instance
+                    and member.definition.definitionKind == A.DefinitionKind.Module):
                 visit(member, False)
 
     for inst in top_instances:
