@@ -2,11 +2,24 @@
 
 Verilog/SystemVerilog からブロック図(モジュール階層+ポート接続)を生成するツール。
 
+**Web版(インストール不要): https://ya-uhs.github.io/diagramgen/**
+
 ## パイプライン
 
 ```
-SystemVerilog --(slang/pyslang エラボレーション)--> Yosys互換JSON --(netlistsvg/ELK)--> SVG
+SystemVerilog --(フロントエンド)--> Yosys互換JSON --(netlistsvg/ELK)--> SVG
 ```
+
+フロントエンドは2系統あり、中間フォーマット(Yosys JSON)で合流する:
+
+| | フロントエンド | SV対応 | 用途 |
+|---|---|---|---|
+| ローカル | slang (pyslang) | 完全 | `make serve` / CLI |
+| ブラウザ単体 | yosys-wasm ([YoWASP](https://yowasp.org/)) | 限定的(-sv) | GitHub Pages 版 |
+
+Web UI は起動時にslangサーバーの有無を検出し、なければ自動で
+yosys-wasm(ブラウザ内実行)へフォールバックする。SpinalHDL/Chisel などが
+生成する Verilog-2001 は yosys フロントエンドで完全に扱える。
 
 - **フロントエンド**: [slang](https://github.com/MikePopoloski/slang) の Python バインディング
   [pyslang](https://pypi.org/project/pyslang/)。合成は行わず、エラボレーション結果から
