@@ -66,6 +66,8 @@
   <button id="openDir">フォルダを開く</button>
   <label for="module" style="color:var(--dim)">module:</label>
   <select id="module"></select>
+  <label for="theme" style="color:var(--dim)">theme:</label>
+  <select id="theme"></select>
   <div class="spacer"></div>
   <span id="frontend"></span>
   <span id="status"></span>
@@ -241,7 +243,59 @@ function updateModuleList() {
   }
 }
 
-// Deterministic pastel color per module type.
+// ---- theming ---------------------------------------------------------
+// All visual styling lives here: swap fonts, wire colors, background and
+// the per-module-type palette per theme. Cell colors are derived from a
+// hash of the module type name, so a given module keeps its color across
+// edits, reloads and sessions.
+
+const SANS = 'ui-sans-serif, -apple-system, "Helvetica Neue", Arial, sans-serif';
+const MONO = '"SF Mono", Menlo, Consolas, monospace';
+
+const THEMES = {
+  pastel: {
+    label: 'Pastel',
+    font: SANS, bg: '#ffffff',
+    wire: '#565a6e', wireWidth: 1.1, text: '#1a1a22',
+    marker: '#eceef4', markerStroke: '#565a6e',
+    cellFill: (h) => `hsl(${h} 60% 91%)`,
+    cellStroke: (h) => `hsl(${h} 45% 42%)`,
+  },
+  classic: {
+    label: 'Classic',
+    font: MONO, bg: '#ffffff',
+    wire: '#000000', wireWidth: 1.25, text: '#000000',
+    marker: '#ffffff', markerStroke: '#000000',
+    cellFill: () => '#ffffff',
+    cellStroke: () => '#000000',
+  },
+  blueprint: {
+    label: 'Blueprint',
+    font: SANS, bg: '#153050',
+    wire: '#a9c7e8', wireWidth: 1.1, text: '#eaf2fb',
+    marker: '#1d4066', markerStroke: '#a9c7e8',
+    cellFill: (h) => `hsl(${h} 45% 28% / 0.85)`,
+    cellStroke: (h) => `hsl(${h} 65% 75%)`,
+  },
+};
+
+let theme = localStorage.getItem('diagramgen-theme') || 'pastel';
+if (!THEMES[theme]) theme = 'pastel';
+
+const $theme = document.getElementById('theme');
+for (const [key, t] of Object.entries(THEMES)) {
+  const opt = document.createElement('option');
+  opt.value = key; opt.textContent = t.label;
+  $theme.appendChild(opt);
+}
+$theme.value = theme;
+$theme.onchange = () => {
+  theme = $theme.value;
+  localStorage.setItem('diagramgen-theme', theme);
+  renderModule();
+};
+
+// Deterministic hue per module type name.
 function hueOf(name) {
   let h = 0;
   for (const c of name) h = (h * 31 + c.codePointAt(0)) >>> 0;
@@ -251,20 +305,24 @@ function hueOf(name) {
 function stylize(mod) {
   const svg = $diagram.querySelector('svg');
   if (!svg) return;
+  const t = THEMES[theme];
+  document.getElementById('right').style.background = t.bg;
   const style = document.createElementNS('http://www.w3.org/2000/svg', 'style');
   style.textContent = `
-    text { font-family: ui-sans-serif, -apple-system, "Helvetica Neue", sans-serif; }
-    line, path { stroke-linecap: round; }
+    text { font-family: ${t.font} !important; fill: ${t.text} !important; }
+    line { stroke: ${t.wire}; stroke-width: ${t.wireWidth}; stroke-linecap: round; }
+    circle { fill: ${t.wire} !important; }
+    path { fill: ${t.marker}; stroke: ${t.markerStroke}; stroke-width: 1.25; }
   `;
-  svg.prepend(style);
+  svg.append(style);
   for (const [inst, cell] of Object.entries(mod.cells || {})) {
     if (cell.type.startsWith('$')) continue;
     const g = svg.querySelector(`#${CSS.escape('cell_' + inst)}`);
     if (!g) continue;
     const hue = hueOf(cell.type);
     for (const rect of g.querySelectorAll(':scope > rect, rect')) {
-      rect.setAttribute('fill', `hsl(${hue} 60% 91%)`);
-      rect.setAttribute('stroke', `hsl(${hue} 45% 42%)`);
+      rect.setAttribute('fill', t.cellFill(hue));
+      rect.setAttribute('stroke', t.cellStroke(hue));
       rect.setAttribute('stroke-width', '1.5');
       rect.setAttribute('rx', '3');
       break; // only the body rect
