@@ -35,6 +35,12 @@ def _stage_assets() -> None:
     yowasp = ROOT / "node_modules" / "@yowasp" / "yosys" / "gen"
     if yowasp.exists():
         shutil.copytree(yowasp, vendor / "yowasp", dirs_exist_ok=True)
+    # slang compiled to wasm (see wasm/shim.cpp and the Makefile slang-wasm
+    # target); lets static hosting keep full SystemVerilog support.
+    slang_dist = ROOT / "wasm" / "dist"
+    if (slang_dist / "slang.wasm").exists():
+        shutil.copy(slang_dist / "slang.mjs", vendor)
+        shutil.copy(slang_dist / "slang.wasm", vendor)
     sample = ROOT / "rtl" / "soc.sv"
     if sample.exists():
         shutil.copy(sample, WEB_DIR / "sample.sv")

@@ -300,9 +300,47 @@ async function detectFrontend() {
     });
     if (r.ok) { frontend = 'slang'; }
   } catch (e) { /* no server */ }
+  if (!frontend) {
+    try {
+      const r = await fetch('vendor/slang.wasm', { method: 'HEAD' });
+      if (r.ok) frontend = 'slang-wasm';
+    } catch (e) { /* not staged */ }
+  }
   if (!frontend) frontend = 'yosys';
-  $frontend.textContent = frontend === 'slang'
-    ? 'frontend: slang (server)' : 'frontend: yosys (wasm)';
+  $frontend.textContent = {
+    'slang': 'frontend: slang (server)',
+    'slang-wasm': 'frontend: slang (wasm)',
+    'yosys': 'frontend: yosys (wasm)',
+  }[frontend];
+}
+
+let slangWasm = null;
+async function compileSlangWasm(sources) {
+  if (!slangWasm) {
+    setStatus('slang-wasm 読み込み中…');
+    const createSlangModule = (await import('./vendor/slang.mjs')).default;
+    const m = await createSlangModule();
+    const fn = m.cwrap('diagramgen_compile', 'number', ['string']);
+    // Read the returned C string by copying out of the (resizable) wasm
+    // heap first — TextDecoder refuses views on resizable ArrayBuffers.
+    slangWasm = (input) => {
+      const ptr = fn(input);
+      let end = ptr;
+      while (m.HEAPU8[end] !== 0) end++;
+      return new TextDecoder().decode(m.HEAPU8.slice(ptr, end));
+    };
+  }
+  const input = sources.map(f =>
+    '\x01' + f.name.replaceAll('\x01', '_').replaceAll('\x02', '_') +
+    '\x02' + f.content).join('');
+  let out;
+  try {
+    out = JSON.parse(slangWasm(input));
+  } catch (e) {
+    return { ok: false, error: 'slang-wasm: ' + e };
+  }
+  if (out.error) return { ok: false, error: out.error };
+  return { ok: true, netlist: out };
 }
 
 async function compileSlang(sources) {
@@ -545,8 +583,8 @@ async function compile() {
   syncActive();
   setStatus('コンパイル中…');
   const sources = files.map(f => ({ name: f.name, content: f.content }));
-  const result = frontend === 'slang'
-    ? await compileSlang(sources)
+  const result = frontend === 'slang' ? await compileSlang(sources)
+    : frontend === 'slang-wasm' ? await compileSlangWasm(sources)
     : await compileYosys(sources);
   if (!result.ok) {
     showErrors(result.error);

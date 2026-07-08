@@ -7,3 +7,5 @@ web/vendor/
 web/sample.sv
 .claude/
 .DS_Store
+build-wasm/
+slang-src/
