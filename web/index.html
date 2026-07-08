@@ -130,6 +130,7 @@
   <select id="module"></select>
   <label for="theme" style="color:var(--dim)">theme:</label>
   <select id="theme"></select>
+  <label class="chk" title="ポート方向の多数決でマスター→スレーブの意味順(CPU→バス→周辺)に配置する"><input type="checkbox" id="semanticOrder" checked>意味順配置</label>
   <label class="chk"><input type="checkbox" id="showLabels" checked>信号ラベル</label>
   <label class="chk" title="「非表示」フラグ付きの色ルールにマッチするネットを図から除く"><input type="checkbox" id="hideClk">非表示ルール適用</label>
   <button id="rulesBtn">設定</button>
@@ -182,7 +183,6 @@
   </div>
 </main>
 <div id="tooltip"></div>
-<script src="vendor/elk.bundled.js"></script>
 <script src="vendor/netlistsvg.bundle.js"></script>
 <script>
 const $src = document.getElementById('src');
@@ -487,7 +487,7 @@ async function renderFsmDiagram(fsm) {
       ? [{ text: e.label, width: e.label.length * 6.4 + 8, height: 13 }]
       : [],
   }));
-  const g = await new ELK().layout({
+  const g = await new netlistsvg.ELK().layout({
     id: 'root',
     layoutOptions: {
       'elk.algorithm': 'layered',
@@ -957,6 +957,81 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 const legendNet = new Set();  // net-rule labels present in the diagram
 const legendMod = new Set();  // module-rule labels present in the diagram
 
+// ---- semantic ordering ---------------------------------------------------
+// Masters drive more nets into their slaves than they get back (addr/wdata/
+// we vs. a single rdata), so a majority vote over net directions yields the
+// architectural order (CPU -> interconnect -> peripherals) without any AI.
+// Cycles (e.g. an irq line back into the CPU) are broken by dropping the
+// weakest edges; the resulting layers become ELK partition constraints.
+
+function computePartitions(mod) {
+  const nets = new Map();
+  const touch = (id) => {
+    if (!nets.has(id)) nets.set(id, { drivers: new Set(), sinks: new Set() });
+    return nets.get(id);
+  };
+  for (const [pname, p] of Object.entries(mod.ports || {})) {
+    for (const b of p.bits || []) {
+      if (typeof b !== 'number') continue;
+      (p.direction === 'input' ? touch(b).drivers : touch(b).sinks)
+        .add('$port:' + pname);
+    }
+  }
+  for (const [cname, c] of Object.entries(mod.cells || {})) {
+    for (const [pn, bits] of Object.entries(c.connections || {})) {
+      const dir = c.port_directions?.[pn];
+      for (const b of bits || []) {
+        if (typeof b !== 'number') continue;
+        if (dir === 'output') touch(b).drivers.add(cname);
+        else if (dir === 'input') touch(b).sinks.add(cname);
+        else { touch(b).drivers.add(cname); touch(b).sinks.add(cname); }
+      }
+    }
+  }
+  const w = new Map();
+  for (const { drivers, sinks } of nets.values()) {
+    for (const a of drivers) for (const b of sinks) {
+      if (a !== b) w.set(a + '>' + b, (w.get(a + '>' + b) || 0) + 1);
+    }
+  }
+  const cells = Object.keys(mod.cells || {});
+  const margins = [];
+  for (const a of cells) for (const b of cells) {
+    if (a === b) continue;
+    const m = (w.get(a + '>' + b) || 0) - (w.get(b + '>' + a) || 0);
+    if (m > 0) margins.push([a, b, m]);
+  }
+  margins.sort((x, y) => y[2] - x[2]);
+  const adj = new Map(cells.map(c => [c, new Set()]));
+  const reaches = (src, dst) => {
+    const stack = [src], seen = new Set();
+    while (stack.length) {
+      const n = stack.pop();
+      if (n === dst) return true;
+      if (seen.has(n)) continue;
+      seen.add(n);
+      for (const nx of adj.get(n)) stack.push(nx);
+    }
+    return false;
+  };
+  for (const [a, b] of margins) if (!reaches(b, a)) adj.get(a).add(b);
+  const layer = new Map(cells.map(c => [c, 0]));
+  for (let i = 0; i < cells.length; i++) {
+    let changed = false;
+    for (const a of cells) for (const b of adj.get(a)) {
+      if (layer.get(b) < layer.get(a) + 1) { layer.set(b, layer.get(a) + 1); changed = true; }
+    }
+    if (!changed) break;
+  }
+  const maxL = Math.max(0, ...layer.values());
+  const part = new Map();
+  for (const [pname, p] of Object.entries(mod.ports || {})) {
+    part.set(pname, p.direction === 'output' ? maxL + 2 : 0);
+  }
+  for (const c of cells) part.set(c, layer.get(c) + 1);
+  return part;
+}
+
 function stylize(mod) {
   const svg = $diagram.querySelector('svg');
   if (!svg) return;
@@ -1051,7 +1126,22 @@ async function doRenderModule() {
   const mod = copy.modules[$module.value];
   if (document.getElementById('hideClk').checked) pruneHiddenNets(mod);
   try {
-    const svg = await netlistsvg.render(skin, copy);
+    const g = netlistsvg.buildGraph(skin, copy);
+    const extra = {};
+    if (document.getElementById('semanticOrder').checked) {
+      const part = computePartitions(mod);
+      for (const child of g.kgraph.children) {
+        if (part.has(child.id)) {
+          child.layoutOptions = Object.assign({}, child.layoutOptions,
+            { 'org.eclipse.elk.partitioning.partition': part.get(child.id) });
+        }
+      }
+      extra['org.eclipse.elk.partitioning.activate'] = true;
+    }
+    const layouted = await new netlistsvg.ELK().layout(g.kgraph, {
+      layoutOptions: Object.assign({}, g.layoutProps.layoutEngine, extra),
+    });
+    const svg = g.draw(layouted);
     $diagram.innerHTML = svg;
     stylize(mod);
     if (document.getElementById('showLabels').checked) {
@@ -1307,6 +1397,10 @@ $src.addEventListener('input', () => {
 $module.addEventListener('change', () => { fitPending = true; renderModule(); });
 document.getElementById('showLabels').addEventListener('change', renderModule);
 document.getElementById('hideClk').addEventListener('change', renderModule);
+document.getElementById('semanticOrder').addEventListener('change', () => {
+  fitPending = true;
+  renderModule();
+});
 document.getElementById('viewMode').addEventListener('change', async (e) => {
   viewMode = e.target.value;
   navStack.length = 0;

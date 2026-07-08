@@ -6,6 +6,7 @@ Standard library only — no server-side dependencies beyond pyslang.
 import argparse
 import json
 import shutil
+import subprocess
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -20,9 +21,15 @@ def _stage_assets() -> None:
     vendor = WEB_DIR / "vendor"
     vendor.mkdir(parents=True, exist_ok=True)
     nsvg = ROOT / "node_modules" / "netlistsvg"
-    shutil.copy(nsvg / "built" / "netlistsvg.bundle.js", vendor)
     shutil.copy(nsvg / "lib" / "default.svg", vendor)
-    shutil.copy(ROOT / "node_modules" / "elkjs" / "lib" / "elk.bundled.js", vendor)
+    # Custom netlistsvg bundle (exposes buildGraph for semantic layout and
+    # a current elkjs); see web-src/netlistsvg-entry.js.
+    subprocess.run(
+        [str(ROOT / "node_modules" / ".bin" / "esbuild"),
+         str(ROOT / "web-src" / "netlistsvg-entry.js"),
+         "--bundle", "--format=iife", "--global-name=netlistsvg", "--minify",
+         f"--outfile={vendor / 'netlistsvg.bundle.js'}", "--log-level=error"],
+        cwd=ROOT, check=True)
     # yosys-wasm frontend (used when no slang server is reachable, e.g. static
     # hosting). The gen/ dir holds the wasm binaries after a first Node run.
     yowasp = ROOT / "node_modules" / "@yowasp" / "yosys" / "gen"

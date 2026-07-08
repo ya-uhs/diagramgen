@@ -12,6 +12,7 @@
   "type": "commonjs",
   "dependencies": {
     "@yowasp/yosys": "^0.65.176-dev.1145",
+    "elkjs": "^0.11.1",
     "esbuild": "^0.28.1",
     "netlistsvg": "^1.0.2"
   }
