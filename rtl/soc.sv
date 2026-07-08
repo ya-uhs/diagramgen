@@ -35,6 +35,27 @@ module uart (
     output logic        tx,
     output logic        irq
 );
+    typedef enum logic [1:0] {IDLE, START, DATA, STOP} tx_state_t;
+    (* fsm_encoding = "auto" *) tx_state_t tx_state;
+    logic [2:0] bit_cnt;
+
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            tx_state <= IDLE;
+            bit_cnt  <= '0;
+        end else begin
+            case (tx_state)
+                IDLE:  if (we) tx_state <= START;
+                START: tx_state <= DATA;
+                DATA:  begin
+                    bit_cnt <= bit_cnt + 1'b1;
+                    if (&bit_cnt) tx_state <= STOP;
+                end
+                STOP:  tx_state <= IDLE;
+            endcase
+        end
+    end
+    assign tx = (tx_state == IDLE);
 endmodule
 
 module gpio (

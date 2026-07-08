@@ -121,6 +121,11 @@
   <h1>diagramgen</h1>
   <button id="openFiles">ファイルを開く</button>
   <button id="openDir">フォルダを開く</button>
+  <label for="viewMode" style="color:var(--dim)">view:</label>
+  <select id="viewMode">
+    <option value="block">ブロック図</option>
+    <option value="fsm">FSM</option>
+  </select>
   <label for="module" style="color:var(--dim)">module:</label>
   <select id="module"></select>
   <label for="theme" style="color:var(--dim)">theme:</label>
@@ -207,6 +212,11 @@ let fitPending = true;
 let currentModule = null;         // module data of the rendered diagram
 const netNameById = new Map();    // net id -> display name
 const navStack = [];              // for drill-down "back"
+
+// FSM view state.
+let viewMode = 'block';           // 'block' | 'fsm'
+let fsms = [];                    // FSMs extracted by yosys (fsm_export)
+let fsmsStale = true;
 
 function setStatus(text, isErr = false) {
   $status.textContent = text;
@@ -304,11 +314,15 @@ async function compileSlang(sources) {
   return resp.json();
 }
 
-async function compileYosys(sources) {
+async function ensureYosysMod() {
   if (!yosysMod) {
     setStatus('yosys-wasm 読み込み中…(初回は数十MBのダウンロード)');
     yosysMod = await import('./vendor/yowasp/bundle.js');
   }
+  return yosysMod;
+}
+
+function yosysFiles(sources) {
   const fsFiles = {};
   const names = [];
   for (const f of sources) {
@@ -316,6 +330,12 @@ async function compileYosys(sources) {
     fsFiles[name] = f.content;
     names.push(name);
   }
+  return { fsFiles, names };
+}
+
+async function compileYosys(sources) {
+  await ensureYosysMod();
+  const { fsFiles, names } = yosysFiles(sources);
   const script = `read_verilog -sv ${names.join(' ')}; ` +
     'hierarchy -auto-top; proc; delete */t:$*; write_json out.json';
   let stderr = '';
@@ -329,6 +349,194 @@ async function compileYosys(sources) {
   } catch (e) {
     return { ok: false, error: stderr || String(e) };
   }
+}
+
+// ---- FSM extraction (yosys fsm_export, works on any frontend) ----------
+
+async function ensureFsms() {
+  if (!fsmsStale) return;
+  syncActive();
+  setStatus('FSM抽出中…');
+  await ensureYosysMod();
+  const { fsFiles, names } = yosysFiles(files);
+  const script = `read_verilog -sv ${names.join(' ')}; ` +
+    'hierarchy -auto-top; proc; fsm_detect; fsm_extract; fsm_export; write_json fsm.json';
+  fsms = [];
+  try {
+    const out = await yosysMod.runYosys(['-q', '-p', script], fsFiles,
+                                        { stdout: null, stderr: null });
+    const json = out['fsm.json'] ? JSON.parse(String(out['fsm.json'])) : null;
+    for (const [fname, content] of Object.entries(out)) {
+      if (fname.endsWith('.kiss2')) fsms.push(parseFsm(fname, String(content), json));
+    }
+  } catch (e) { /* compile error: leave fsms empty */ }
+  fsmsStale = false;
+}
+
+function parseFsm(fname, kiss, json) {
+  const modName = fname.split('-$fsm$')[0];
+  const sigMatch = fname.match(/\$fsm\$\\?(.+?)\$\d+\.kiss2$/);
+  const sig = sigMatch ? sigMatch[1] : 'fsm';
+
+  let reset = null;
+  const trans = [];
+  const states = new Set();
+  for (const line of kiss.split('\n').map(l => l.trim()).filter(Boolean)) {
+    if (line.startsWith('.r ')) { reset = line.slice(3).trim(); continue; }
+    if (line.startsWith('.')) continue;
+    const [inp, from, to] = line.split(/\s+/);
+    if (!to) continue;
+    states.add(from); states.add(to);
+    trans.push({ from, to, inp });
+  }
+
+  // Recover CTRL_IN signal names from the $fsm cell in the JSON dump.
+  // KISS2 input columns are MSB-first: leftmost char = highest CTRL_IN bit.
+  let inputs = [];
+  const mod = json?.modules?.[modName];
+  if (mod) {
+    const cell = Object.values(mod.cells || {}).find(c =>
+      c.type === '$fsm' && (c.parameters?.NAME || '').replace(/^\\/, '') === sig);
+    if (cell) {
+      inputs = (cell.connections.CTRL_IN || []).map((bit, i) => {
+        const named = Object.entries(mod.netnames || {}).find(([n, nn]) =>
+          !n.startsWith('$') && (nn.bits || []).includes(bit));
+        return named ? named[0] : `in${i}`;
+      });
+    }
+  }
+
+  const edgeMap = new Map();
+  for (const t of trans) {
+    const label = [...t.inp].reverse()
+      .map((ch, i) => ch === '-' ? null : `${inputs[i] ?? 'in' + i}=${ch}`)
+      .filter(Boolean).join(' & ');
+    const key = t.from + '>' + t.to;
+    if (!edgeMap.has(key)) edgeMap.set(key, { from: t.from, to: t.to, labels: new Set() });
+    edgeMap.get(key).labels.add(label);
+  }
+  const edges = [...edgeMap.values()].map(e => ({
+    from: e.from, to: e.to,
+    label: [...e.labels].filter(Boolean).join(' | '),
+  }));
+  return { name: `${modName}.${sig}`, states: [...states], reset, edges };
+}
+
+function escapeXml(s) {
+  return s.replace(/[&<>"]/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+// With 非表示ルール適用 ON, reset arcs disappear from the state graph:
+// per hidden input, the value that alone jumps to the reset state is taken
+// as "reset active"; alternatives requiring it are dropped and the other
+// polarity is stripped from remaining conditions.
+function fsmVisibleEdges(fsm) {
+  if (!document.getElementById('hideClk').checked) return fsm.edges;
+  // Tally which value of each hidden input jumps to reset from the most
+  // states — that's the reset-active polarity (a normal transition into the
+  // reset state from one state must not poison the vote).
+  const votes = new Map();  // sig -> val -> Set(sources)
+  for (const e of fsm.edges) {
+    if (e.to !== fsm.reset || !e.label) continue;
+    for (const alt of e.label.split(' | ')) {
+      const terms = alt.split(' & ');
+      if (terms.length !== 1) continue;
+      const [sig, val] = terms[0].split('=');
+      if (!matchesHiddenRule(sig)) continue;
+      if (!votes.has(sig)) votes.set(sig, new Map());
+      if (!votes.get(sig).has(val)) votes.get(sig).set(val, new Set());
+      votes.get(sig).get(val).add(e.from);
+    }
+  }
+  const resetVal = new Map();
+  for (const [sig, byVal] of votes) {
+    const best = [...byVal.entries()].sort((a, b) => b[1].size - a[1].size)[0];
+    if (best && best[1].size >= 2) resetVal.set(sig, best[0]);
+  }
+  const out = [];
+  for (const e of fsm.edges) {
+    if (!e.label) { out.push(e); continue; }
+    const alts = [];
+    let unconditional = false;
+    for (const alt of e.label.split(' | ')) {
+      const terms = alt.split(' & ');
+      if (terms.some(term => {
+        const [sig, val] = term.split('=');
+        return resetVal.get(sig) === val;
+      })) continue;
+      const kept = terms.filter(term => !matchesHiddenRule(term.split('=')[0]));
+      if (!kept.length) unconditional = true;
+      else alts.push(kept.join(' & '));
+    }
+    if (!alts.length && !unconditional) continue;  // fires only under reset
+    out.push({ ...e, label: unconditional ? '' : [...new Set(alts)].join(' | ') });
+  }
+  return out;
+}
+
+async function renderFsmDiagram(fsm) {
+  const t = THEMES[theme];
+  document.getElementById('right').style.background = t.bg;
+  const nodes = fsm.states.map(s => ({
+    id: s, width: Math.max(52, s.length * 9 + 26), height: 30,
+  }));
+  const edges = fsmVisibleEdges(fsm).map((e, i) => ({
+    id: 'e' + i, sources: [e.from], targets: [e.to],
+    labels: e.label
+      ? [{ text: e.label, width: e.label.length * 6.4 + 8, height: 13 }]
+      : [],
+  }));
+  const g = await new ELK().layout({
+    id: 'root',
+    layoutOptions: {
+      'elk.algorithm': 'layered',
+      'elk.direction': 'DOWN',
+      'elk.spacing.nodeNode': '45',
+      'elk.layered.spacing.nodeNodeBetweenLayers': '55',
+      'elk.spacing.edgeLabel': '4',
+    },
+    children: nodes, edges,
+  });
+  const parts = [];
+  parts.push(`<defs><marker id="fsmarrow" viewBox="0 0 10 10" refX="9" refY="5" ` +
+    `markerWidth="7" markerHeight="7" orient="auto-start-reverse">` +
+    `<path d="M0,0 L10,5 L0,10 z" fill="${t.wire}" stroke="none"/></marker></defs>`);
+  for (const e of g.edges || []) {
+    for (const s of e.sections || []) {
+      const pts = [s.startPoint, ...(s.bendPoints || []), s.endPoint]
+        .map(p => `${p.x},${p.y}`).join(' ');
+      parts.push(`<polyline points="${pts}" fill="none" stroke="${t.wire}" ` +
+        `stroke-width="1.3" marker-end="url(#fsmarrow)"/>`);
+    }
+    for (const l of e.labels || []) {
+      parts.push(`<text x="${l.x + l.width / 2}" y="${l.y + 10}" text-anchor="middle" ` +
+        `style="font: 10px ${t.font}; fill: ${t.text}">${escapeXml(l.text)}</text>`);
+    }
+  }
+  for (const n of g.children || []) {
+    const isReset = n.id === fsm.reset;
+    parts.push(`<rect x="${n.x}" y="${n.y}" width="${n.width}" height="${n.height}" ` +
+      `rx="15" fill="${t.marker}" stroke="${isReset ? '#ff5d8f' : t.markerStroke}" ` +
+      `stroke-width="${isReset ? 2.2 : 1.4}"/>`);
+    parts.push(`<text x="${n.x + n.width / 2}" y="${n.y + n.height / 2 + 3.8}" ` +
+      `text-anchor="middle" style="font: 600 11px ${t.font}; fill: ${t.text}">` +
+      `${escapeXml(n.id)}</text>`);
+  }
+  $diagram.innerHTML =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${Math.ceil(g.width)}" ` +
+    `height="${Math.ceil(g.height)}">${parts.join('')}</svg>`;
+  document.getElementById('legend')?.remove();
+}
+
+function updateFsmList() {
+  $module.innerHTML = '';
+  fsms.forEach((f, i) => {
+    const opt = document.createElement('option');
+    opt.value = String(i);
+    opt.textContent = f.name;
+    $module.appendChild(opt);
+  });
 }
 
 // ---- compile & render ------------------------------------------------
@@ -349,7 +557,13 @@ async function compile() {
   }
   $errors.style.display = 'none';
   netlist = result.netlist;
-  updateModuleList();
+  fsmsStale = true;
+  if (viewMode === 'fsm') {
+    await ensureFsms();
+    updateFsmList();
+  } else {
+    updateModuleList();
+  }
   await renderModule();
 }
 
@@ -813,6 +1027,20 @@ async function renderModule() {
 }
 
 async function doRenderModule() {
+  if (viewMode === 'fsm') {
+    const fsm = fsms[Number($module.value)];
+    if (!fsm) {
+      $diagram.innerHTML = '';
+      document.getElementById('legend')?.remove();
+      setStatus('FSMが見つかりません — 状態レジスタに (* fsm_encoding = "auto" *) を付けると検出されます', true);
+      return;
+    }
+    await renderFsmDiagram(fsm);
+    if (fitPending) { fitPending = false; fitView(); } else { applyView(); }
+    $diagram.classList.remove('stale');
+    setStatus('OK');
+    return;
+  }
   if (!netlist) return;
   const skin = await getSkin(THEMES[theme].skin);
   const copy = JSON.parse(JSON.stringify(netlist));
@@ -962,6 +1190,7 @@ function updateBackBtn() {
 }
 
 $diagram.addEventListener('dblclick', (e) => {
+  if (viewMode !== 'block') return;
   const g = e.target.closest('g[id^="cell_"]');
   if (!g || !currentModule) return;
   const cell = (currentModule.cells || {})[g.id.slice(5)];
@@ -1078,6 +1307,19 @@ $src.addEventListener('input', () => {
 $module.addEventListener('change', () => { fitPending = true; renderModule(); });
 document.getElementById('showLabels').addEventListener('change', renderModule);
 document.getElementById('hideClk').addEventListener('change', renderModule);
+document.getElementById('viewMode').addEventListener('change', async (e) => {
+  viewMode = e.target.value;
+  navStack.length = 0;
+  updateBackBtn();
+  if (viewMode === 'fsm') {
+    await ensureFsms();
+    updateFsmList();
+  } else {
+    updateModuleList();
+  }
+  fitPending = true;
+  await renderModule();
+});
 
 async function loadSample() {
   const sample = await fetch('sample.sv');
