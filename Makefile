@@ -1,5 +1,4 @@
 PYTHON := .venv/bin/python
-NETLISTSVG := ./node_modules/.bin/netlistsvg
 
 RTL := $(wildcard rtl/*.sv)
 SVGS := $(patsubst rtl/%.sv,build/%.svg,$(RTL))
@@ -10,7 +9,7 @@ build/%.json: rtl/%.sv src/diagramgen/*.py | build
 	PYTHONPATH=src $(PYTHON) -m diagramgen.cli $< -o $@
 
 build/%.svg: build/%.json
-	$(NETLISTSVG) $< -o $@
+	node scripts/render.js $< $@
 
 build:
 	mkdir -p build

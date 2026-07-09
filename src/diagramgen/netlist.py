@@ -32,6 +32,7 @@ class ModuleNets:
     def __init__(self) -> None:
         self._ids: Dict[str, int] = {}
         self._next = 2  # ids 0/1 are reserved by Yosys convention
+        self.local_name = lambda sym: str(sym.name)
 
     def id_for(self, name: str) -> int:
         if name not in self._ids:
@@ -59,7 +60,7 @@ def _resolve(expr, nets: ModuleNets) -> Optional[List[BitToken]]:
     if kind == A.ExpressionKind.Conversion:
         return _resolve(expr.operand, nets)
     if kind in (A.ExpressionKind.NamedValue, A.ExpressionKind.HierarchicalValue):
-        return [nets.id_for(expr.symbol.name)]
+        return [nets.id_for(nets.local_name(expr.symbol))]
     if kind in (A.ExpressionKind.ElementSelect, A.ExpressionKind.RangeSelect,
                 A.ExpressionKind.MemberAccess):
         return _resolve(expr.value, nets)
@@ -80,12 +81,50 @@ def _resolve(expr, nets: ModuleNets) -> Optional[List[BitToken]]:
     return [nets.fresh("expr")]
 
 
-def _extract_module(inst_body) -> dict:
+def _walk_members(scope, gen_prefix=""):
+    """Yield (prefix, member), descending into generate blocks/arrays and
+    instance arrays so their contents appear with hierarchical cell names."""
+    for member in scope:
+        if member.kind == A.SymbolKind.GenerateBlock:
+            if getattr(member, "isUninstantiated", False):
+                continue
+            name = member.name or f"genblk{member.constructIndex}"
+            yield from _walk_members(member, f"{gen_prefix}{name}.")
+        elif member.kind == A.SymbolKind.GenerateBlockArray:
+            for blk in member:
+                if (blk.kind != A.SymbolKind.GenerateBlock
+                        or getattr(blk, "isUninstantiated", False)):
+                    continue
+                name = f"{member.name}[{blk.arrayIndex}]"
+                yield from _walk_members(blk, f"{gen_prefix}{name}.")
+        elif member.kind == A.SymbolKind.InstanceArray:
+            for i, el in enumerate(member):
+                if el.kind == A.SymbolKind.Instance:
+                    yield f"{gen_prefix}{member.name}[{i}].", el
+        else:
+            yield gen_prefix, member
+
+
+def _extract_module(inst_body, inst_path: str) -> dict:
     nets = ModuleNets()
     ports = {}
     cells = {}
+    prefix = inst_path + "."
 
-    for member in inst_body:
+    def local_name(sym) -> str:
+        # Hierarchical path relative to this module disambiguates same-named
+        # nets living in different generate blocks.
+        try:
+            path = sym.hierarchicalPath
+        except Exception:
+            return str(sym.name)
+        if path.startswith(prefix):
+            return path[len(prefix):]
+        return str(sym.name)
+
+    nets.local_name = local_name
+
+    for gen_prefix, member in _walk_members(inst_body):
         if member.kind == A.SymbolKind.Port:
             if member.isNullPort or member.internalSymbol is None:
                 continue
@@ -103,7 +142,7 @@ def _extract_module(inst_body) -> dict:
             if member.definition.definitionKind != A.DefinitionKind.Module:
                 # Interface (or program) instances behave like nets: every
                 # module port bound to them connects to this single id.
-                nets.id_for(member.name)
+                nets.id_for(local_name(member))
                 continue
             connections = {}
             directions = {}
@@ -113,7 +152,7 @@ def _extract_module(inst_body) -> dict:
                     if iface is None:
                         continue
                     directions[pc.port.name] = "inout"
-                    connections[pc.port.name] = [nets.id_for(iface.name)]
+                    connections[pc.port.name] = [nets.id_for(local_name(iface))]
                     continue
                 if pc.port.kind != A.SymbolKind.Port:
                     continue
@@ -122,7 +161,9 @@ def _extract_module(inst_body) -> dict:
                 if tokens is None:
                     tokens = [nets.fresh(f"unconn_{member.name}_{pc.port.name}")]
                 connections[pc.port.name] = tokens
-            cells[member.name] = {
+            cell_name = (f"{gen_prefix}{member.name}" if member.name
+                         else gen_prefix.rstrip("."))
+            cells[cell_name] = {
                 "type": member.definition.name,
                 "port_directions": directions,
                 "connections": connections,
@@ -191,10 +232,10 @@ def _extract_from_trees(trees, top: Optional[str], source_manager) -> dict:
             if is_top:
                 modules[name].setdefault("attributes", {})["top"] = 1
             return
-        modules[name] = _extract_module(inst.body)
+        modules[name] = _extract_module(inst.body, inst.hierarchicalPath)
         if is_top:
             modules[name]["attributes"] = {"top": 1}
-        for member in inst.body:
+        for _prefix, member in _walk_members(inst.body):
             if (member.kind == A.SymbolKind.Instance
                     and member.definition.definitionKind == A.DefinitionKind.Module):
                 visit(member, False)

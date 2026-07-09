@@ -34,6 +34,17 @@ slang-wasm は slang v11 を Emscripten でビルドし、`wasm/shim.cpp`
 - **レイアウト/描画**: 当面は [netlistsvg](https://github.com/nturley/netlistsvg)
   (内部は elkjs = Eclipse Layout Kernel)。将来的に自作レイアウトエンジンへ差し替え予定。
 
+## サンプル設計
+
+`rtl/soc.sv` は「実戦的な SystemVerilog がそのまま通る」ことを示す小さな
+SoC になっている: package(typedef/enum/localparam)、modport 付き
+interface でのバス配線、実装入りのサブモジュール階層
+(cpu の中に regfile/alu、実ロジック付き)、`(* fsm_encoding *)` 付き FSM
+(cpu のフェーズ制御と uart の TX)、for-generate によるインスタンス生成
+(gpio の 2FF シンクロナイザ×8、図では `g_sync[0].u_sync` のような
+階層名で現れる)。generate ブロック内のローカル信号は
+ブロックごとに区別して抽出される。
+
 ## セットアップ
 
 ```sh

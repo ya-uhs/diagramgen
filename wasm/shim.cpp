@@ -6,6 +6,7 @@
 //   output: netlist JSON, or {"error": "<rendered diagnostics>"}
 // The returned pointer stays valid until the next call.
 
+#include <functional>
 #include <map>
 #include <sstream>
 #include <string>
@@ -17,6 +18,7 @@
 #include "slang/ast/expressions/MiscExpressions.h"
 #include "slang/ast/expressions/OperatorExpressions.h"
 #include "slang/ast/expressions/SelectExpressions.h"
+#include "slang/ast/symbols/BlockSymbols.h"
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/symbols/PortSymbols.h"
@@ -58,6 +60,7 @@ std::string jsonEscape(std::string_view s) {
 struct ModuleNets {
     std::map<std::string, int> ids;
     int next = 2;
+    std::string pathPrefix; // hierarchical path of the module instance + "."
 
     int idFor(const std::string& name) {
         auto [it, inserted] = ids.emplace(name, next);
@@ -69,6 +72,15 @@ struct ModuleNets {
     int fresh(const std::string& hint) {
         return idFor("$" + hint + "$" + std::to_string(next));
     }
+
+    // Module-relative hierarchical name; disambiguates same-named nets in
+    // different generate blocks.
+    std::string localName(const Symbol& sym) {
+        std::string path = sym.getHierarchicalPath();
+        if (path.rfind(pathPrefix, 0) == 0)
+            return path.substr(pathPrefix.size());
+        return std::string(sym.name);
+    }
 };
 
 const char* directionOf(ArgumentDirection dir) {
@@ -76,6 +88,51 @@ const char* directionOf(ArgumentDirection dir) {
         case ArgumentDirection::In: return "input";
         case ArgumentDirection::Out: return "output";
         default: return "inout";
+    }
+}
+
+// Walk scope members, descending into generate blocks/arrays and instance
+// arrays; the callback receives (genPrefix, member).
+void walkMembers(const Scope& scope, const std::string& genPrefix,
+                 const std::function<void(const std::string&, const Symbol&)>& f) {
+    for (auto& member : scope.members()) {
+        if (member.kind == SymbolKind::GenerateBlock) {
+            auto& blk = member.as<GenerateBlockSymbol>();
+            if (blk.isUninstantiated)
+                continue;
+            std::string name = blk.name.empty()
+                                   ? "genblk" + std::to_string(blk.constructIndex)
+                                   : std::string(blk.name);
+            walkMembers(blk, genPrefix + name + ".", f);
+        }
+        else if (member.kind == SymbolKind::GenerateBlockArray) {
+            auto& arr = member.as<GenerateBlockArraySymbol>();
+            for (auto& sub : arr.members()) {
+                if (sub.kind != SymbolKind::GenerateBlock)
+                    continue;
+                auto& blk = sub.as<GenerateBlockSymbol>();
+                if (blk.isUninstantiated)
+                    continue;
+                std::string name = std::string(arr.name) + "[" +
+                                   std::to_string(blk.constructIndex) + "]";
+                walkMembers(blk, genPrefix + name + ".", f);
+            }
+        }
+        else if (member.kind == SymbolKind::InstanceArray) {
+            auto& arr = member.as<InstanceArraySymbol>();
+            int i = 0;
+            for (auto& el : arr.members()) {
+                if (el.kind == SymbolKind::Instance) {
+                    f(genPrefix + std::string(arr.name) + "[" +
+                          std::to_string(i) + "].",
+                      el);
+                }
+                i++;
+            }
+        }
+        else {
+            f(genPrefix, member);
+        }
     }
 }
 
@@ -91,7 +148,7 @@ void resolveExpr(const Expression& expr, ModuleNets& nets, std::vector<std::stri
         case ExpressionKind::NamedValue:
         case ExpressionKind::HierarchicalValue: {
             auto& sym = expr.as<ValueExpressionBase>().symbol;
-            tokens.push_back(std::to_string(nets.idFor(std::string(sym.name))));
+            tokens.push_back(std::to_string(nets.idFor(nets.localName(sym))));
             return;
         }
         case ExpressionKind::ElementSelect:
@@ -120,16 +177,17 @@ void resolveExpr(const Expression& expr, ModuleNets& nets, std::vector<std::stri
     }
 }
 
-std::string extractModule(const InstanceBodySymbol& body) {
+std::string extractModule(const InstanceBodySymbol& body, const std::string& instPath) {
     ModuleNets nets;
+    nets.pathPrefix = instPath + ".";
     std::ostringstream ports, cells;
     bool firstPort = true, firstCell = true;
 
-    for (auto& member : body.members()) {
+    walkMembers(body, "", [&](const std::string& genPrefix, const Symbol& member) {
         if (member.kind == SymbolKind::Port) {
             auto& port = member.as<PortSymbol>();
             if (port.isNullPort || !port.internalSymbol)
-                continue;
+                return;
             if (!firstPort)
                 ports << ",";
             firstPort = false;
@@ -148,8 +206,8 @@ std::string extractModule(const InstanceBodySymbol& body) {
         else if (member.kind == SymbolKind::Instance) {
             auto& inst = member.as<InstanceSymbol>();
             if (inst.getDefinition().definitionKind != DefinitionKind::Module) {
-                nets.idFor(std::string(inst.name));
-                continue;
+                nets.idFor(nets.localName(inst));
+                return;
             }
             std::ostringstream conns, dirs;
             bool firstConn = true;
@@ -163,7 +221,7 @@ std::string extractModule(const InstanceBodySymbol& body) {
                         continue;
                     dir = "inout";
                     tokens.push_back(
-                        std::to_string(nets.idFor(std::string(iface.first->name))));
+                        std::to_string(nets.idFor(nets.localName(*iface.first))));
                 }
                 else if (conn->port.kind == SymbolKind::Port) {
                     dir = directionOf(conn->port.as<PortSymbol>().direction);
@@ -191,15 +249,20 @@ std::string extractModule(const InstanceBodySymbol& body) {
                 }
                 conns << "]";
             }
+            std::string cellName = inst.name.empty()
+                                       ? (genPrefix.empty()
+                                              ? std::string("unnamed")
+                                              : genPrefix.substr(0, genPrefix.size() - 1))
+                                       : genPrefix + std::string(inst.name);
             if (!firstCell)
                 cells << ",";
             firstCell = false;
-            cells << "\"" << jsonEscape(inst.name) << "\":{\"type\":\""
+            cells << "\"" << jsonEscape(cellName) << "\":{\"type\":\""
                   << jsonEscape(inst.getDefinition().name)
                   << "\",\"port_directions\":{" << dirs.str() << "},\"connections\":{"
                   << conns.str() << "}}";
         }
-    }
+    });
 
     std::ostringstream netnames;
     bool firstNet = true;
@@ -223,19 +286,19 @@ void visitInstance(const InstanceSymbol& inst, bool isTop,
     std::string name(inst.getDefinition().name);
     if (modules.count(name))
         return;
-    std::string body = extractModule(inst.body);
+    std::string body = extractModule(inst.body, inst.getHierarchicalPath());
     if (isTop) {
         body.insert(1, "\"attributes\":{\"top\":1},");
     }
     modules.emplace(name, std::move(body));
     order.push_back(name);
-    for (auto& member : inst.body.members()) {
+    walkMembers(inst.body, "", [&](const std::string&, const Symbol& member) {
         if (member.kind == SymbolKind::Instance &&
             member.as<InstanceSymbol>().getDefinition().definitionKind ==
                 DefinitionKind::Module) {
             visitInstance(member.as<InstanceSymbol>(), false, modules, order);
         }
-    }
+    });
 }
 
 std::string resultBuffer;

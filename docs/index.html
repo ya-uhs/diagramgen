@@ -1145,7 +1145,7 @@ async function doRenderModule() {
     if (!fsm) {
       $diagram.innerHTML = '';
       document.getElementById('legend')?.remove();
-      setStatus('FSMが見つかりません — 状態レジスタに (* fsm_encoding = "auto" *) を付けると検出されます', true);
+      setStatus('FSMが見つかりません — 状態レジスタに (* fsm_encoding = "auto" *) を付けると検出されます(FSM抽出はyosysを使うため、interface等yosysが解析できない構文を含む設計では利用できません)', true);
       return;
     }
     await renderFsmDiagram(fsm);
