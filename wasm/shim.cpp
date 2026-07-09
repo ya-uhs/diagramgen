@@ -21,6 +21,7 @@
 #include "slang/ast/symbols/BlockSymbols.h"
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
+#include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/PortSymbols.h"
 #include "slang/diagnostics/DiagnosticEngine.h"
 #include "slang/diagnostics/TextDiagnosticClient.h"
@@ -89,6 +90,28 @@ const char* directionOf(ArgumentDirection dir) {
         case ArgumentDirection::Out: return "output";
         default: return "inout";
     }
+}
+
+// Net direction for an interface connection, from its modport: a mostly-
+// output modport (master) drives the bus net, a mostly-input one receives.
+const char* modportDirection(const ModportSymbol* modport) {
+    if (!modport)
+        return "inout";
+    int outs = 0, ins = 0;
+    for (auto& member : modport->members()) {
+        if (member.kind != SymbolKind::ModportPort)
+            continue;
+        auto dir = member.as<ModportPortSymbol>().direction;
+        if (dir == ArgumentDirection::Out)
+            outs++;
+        else if (dir == ArgumentDirection::In)
+            ins++;
+    }
+    if (outs > ins)
+        return "output";
+    if (ins > outs)
+        return "input";
+    return "inout";
 }
 
 // Walk scope members, descending into generate blocks/arrays and instance
@@ -196,11 +219,12 @@ std::string extractModule(const InstanceBodySymbol& body, const std::string& ins
                   << nets.idFor(std::string(port.internalSymbol->name)) << "]}";
         }
         else if (member.kind == SymbolKind::InterfacePort) {
+            auto conn = member.as<InterfacePortSymbol>().getConnection();
             if (!firstPort)
                 ports << ",";
             firstPort = false;
-            ports << "\"" << jsonEscape(member.name)
-                  << "\":{\"direction\":\"inout\",\"bits\":["
+            ports << "\"" << jsonEscape(member.name) << "\":{\"direction\":\""
+                  << modportDirection(conn.second) << "\",\"bits\":["
                   << nets.idFor(std::string(member.name)) << "]}";
         }
         else if (member.kind == SymbolKind::Instance) {
@@ -219,7 +243,7 @@ std::string extractModule(const InstanceBodySymbol& body, const std::string& ins
                     auto iface = conn->getIfaceConn();
                     if (!iface.first)
                         continue;
-                    dir = "inout";
+                    dir = modportDirection(iface.second);
                     tokens.push_back(
                         std::to_string(nets.idFor(nets.localName(*iface.first))));
                 }

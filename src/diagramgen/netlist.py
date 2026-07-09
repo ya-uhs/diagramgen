@@ -81,6 +81,27 @@ def _resolve(expr, nets: ModuleNets) -> Optional[List[BitToken]]:
     return [nets.fresh("expr")]
 
 
+def _modport_direction(modport) -> str:
+    """Net direction for an interface connection, from its modport: a mostly-
+    output modport (master) drives the bus net, a mostly-input one receives.
+    Without this, interface nets are all-lateral and netlistsvg won't route
+    them (and semantic ordering can't see master/slave through interfaces)."""
+    if modport is None:
+        return "inout"
+    outs = ins = 0
+    for member in modport:
+        d = getattr(member, "direction", None)
+        if d == A.ArgumentDirection.Out:
+            outs += 1
+        elif d == A.ArgumentDirection.In:
+            ins += 1
+    if outs > ins:
+        return "output"
+    if ins > outs:
+        return "input"
+    return "inout"
+
+
 def _walk_members(scope, gen_prefix=""):
     """Yield (prefix, member), descending into generate blocks/arrays and
     instance arrays so their contents appear with hierarchical cell names."""
@@ -134,8 +155,12 @@ def _extract_module(inst_body, inst_path: str) -> dict:
             }
         elif member.kind == A.SymbolKind.InterfacePort:
             # An interface port is a whole signal bundle; model it as one net.
+            try:
+                _iface, modport = member.connection
+            except Exception:
+                modport = None
             ports[member.name] = {
-                "direction": "inout",
+                "direction": _modport_direction(modport),
                 "bits": [nets.id_for(member.name)],
             }
         elif member.kind == A.SymbolKind.Instance:
@@ -148,10 +173,10 @@ def _extract_module(inst_body, inst_path: str) -> dict:
             directions = {}
             for pc in member.portConnections:
                 if pc.port.kind == A.SymbolKind.InterfacePort:
-                    iface, _modport = pc.ifaceConn
+                    iface, modport = pc.ifaceConn
                     if iface is None:
                         continue
-                    directions[pc.port.name] = "inout"
+                    directions[pc.port.name] = _modport_direction(modport)
                     connections[pc.port.name] = [nets.id_for(local_name(iface))]
                     continue
                 if pc.port.kind != A.SymbolKind.Port:
